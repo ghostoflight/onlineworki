@@ -20,6 +20,7 @@ import os
 import re
 import json
 import hashlib
+import html
 import logging
 from functools import wraps
 from datetime import datetime, timezone
@@ -51,7 +52,8 @@ else:
 
 FREE_USES = 5
 # خطوات تتطلّب إدخالاً نصّياً (تُلتقط بمعالج النص)
-TEXT_STEPS = {"device_gaid", "device_idfa", "device_afid", "proxy", "app_value", "schedule_delay"}
+TEXT_STEPS = {"device_gaid", "device_idfa", "device_afid", "proxy", "app_value", "schedule_delay",
+              "add_name", "add_package", "add_devkey", "add_events"}
 
 
 def _default_dev_key() -> str:
@@ -418,6 +420,228 @@ def linked(handler):
 # ═══════════════════════════════════════════════════════════════════════════════
 # Handlers
 # ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# مسار /add — إنشاء مهمة مجدولة بخطوات (يطابق تصميم الواجهة) + القائمة الرئيسية
+# ═══════════════════════════════════════════════════════════════════════════════
+_ADD_EX = {
+    "add_package": ["com.example.app", "com.game.mobile"],
+    "add_events":  ["af_launch,af_login", "af_purchase,af_complete"],
+}
+_ADD_PREV = {
+    "add_package": "add_name",
+    "add_devkey":  "add_package",
+    "add_events":  "add_devkey",
+    "awaiting_confirm": "add_events",
+}
+
+
+def _step_bar(step_no, total=5):
+    return "▰" * step_no + "▱" * (total - step_no)
+
+
+def _send_add_step(chat_id, step, data, err=None):
+    """يرسل رسالة الخطوة (HTML) مع الكيبورد. err اختياري للتحقّق الفاشل."""
+    kb = types.InlineKeyboardMarkup()
+    prefix = f"⚠️ {html.escape(err)}\n\n" if err else ""
+    if step == "add_name":
+        text = (prefix + "➕ <b>إنشاء مهمة جديدة</b>\n\n"
+                f"<code>{_step_bar(1)}</code>  <b>الخطوة 1 من 5</b>\n"
+                "أرسل <b>اسم المهمة</b> (إنجليزي بدون مسافات):\n\n"
+                "مثال: <code>game_launch_v2</code>")
+        kb.row(types.InlineKeyboardButton("❌ إلغاء", callback_data="add:cancel"))
+    elif step == "add_package":
+        text = (prefix + "✅ <b>تم حفظ الاسم</b>\n\n"
+                f"<code>{_step_bar(2)}</code>  <b>الخطوة 2 من 5</b>\n"
+                "أرسل <b>اسم الحزمة</b> (Package Name):\n\n"
+                "مثال: <code>com.example.app</code>")
+        for ex in _ADD_EX["add_package"]:
+            kb.row(types.InlineKeyboardButton(ex, callback_data=f"add:exv:{ex}"))
+        kb.row(types.InlineKeyboardButton("🔙 السابق", callback_data="add:back"),
+               types.InlineKeyboardButton("❌ إلغاء", callback_data="add:cancel"))
+    elif step == "add_devkey":
+        text = (prefix + "✅ تم حفظ الحزمة\n\n"
+                f"<code>{_step_bar(3)}</code>  <b>الخطوة 3 من 5</b>\n"
+                "أرسل <b>Dev Key</b> الخاص بتطبيقك من لوحة AppsFlyer:")
+        kb.row(types.InlineKeyboardButton("🔙 السابق", callback_data="add:back"),
+               types.InlineKeyboardButton("❌ إلغاء", callback_data="add:cancel"))
+    elif step == "add_events":
+        text = (prefix + "✅ تم حفظ المفتاح\n\n"
+                f"<code>{_step_bar(4)}</code>  <b>الخطوة 4 من 5</b>\n"
+                "أرسل <b>أسماء الأحداث</b> مفصولة بفاصلة:\n\n"
+                "مثال: <code>af_launch,af_login,af_purchase</code>")
+        for ex in _ADD_EX["add_events"]:
+            kb.row(types.InlineKeyboardButton(ex, callback_data=f"add:exv:{ex}"))
+        kb.row(types.InlineKeyboardButton("🔙 السابق", callback_data="add:back"),
+               types.InlineKeyboardButton("❌ إلغاء", callback_data="add:cancel"))
+    else:
+        return
+    bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+
+
+def _send_review(chat_id, user, data):
+    """الخطوة 5: مراجعة المهمة مع معاينة Payload (يشبه صندوق التصميم)."""
+    env = _get_env(user["id"])
+    os_ = (env.get("os") or "").lower()
+    afid = env.get("afid", "") or "—"
+    dev_id = (env.get("idfa", "") if os_ == "ios" else env.get("gaid", "")) or "—"
+    id_field = "idfa" if os_ == "ios" else "advertising_id"
+    first_ev = data["events"][0] if data.get("events") else "af_event"
+
+    name     = html.escape(data.get("name", ""))
+    package  = html.escape(data.get("package", ""))
+    dev_mask = html.escape(data.get("dev_key", "")[:6] + "…") if data.get("dev_key") else "—"
+    events_s = html.escape("، ".join(data.get("events", [])))
+
+    payload_raw = (
+        "{\n"
+        f'  "appsflyer_id": "{afid}",\n'
+        f'  "eventName": "{first_ev}",\n'
+        '  "eventTime": "<auto>",\n'
+        '  "eventValue": "{}",\n'
+        f'  "{id_field}": "{dev_id}"\n'
+        "}"
+    )
+    text = (
+        f"<code>{_step_bar(5)}</code>  <b>الخطوة 5 من 5</b>\n"
+        "✅ <b>مراجعة المهمة قبل الحفظ</b>\n\n"
+        f"📌 الاسم: <b>{name}</b>\n"
+        f"📦 الحزمة: <b>{package}</b>\n"
+        f"🔑 Dev Key: <b>{dev_mask}</b>\n"
+        f"📡 الأحداث: <b>{events_s}</b>\n\n"
+        "<b>Payload (معاينة):</b>\n"
+        f"<code>{html.escape(payload_raw)}</code>\n\n"
+        "هل تريد حفظ المهمة؟"
+    )
+    kb = types.InlineKeyboardMarkup()
+    kb.row(types.InlineKeyboardButton("✅ حفظ المهمة", callback_data="add:save"),
+           types.InlineKeyboardButton("🔄 إعادة البدء", callback_data="add:restart"))
+    kb.row(types.InlineKeyboardButton("❌ إلغاء", callback_data="add:cancel"))
+    bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+
+
+def _add_advance(chat_id, user, value):
+    """يعالج إدخال الخطوة الحالية في /add (من نص أو زر مثال) مع التحقّق."""
+    step, data = _get_state(user["id"])
+    value = (value or "").strip()
+    if step == "add_name":
+        if not re.fullmatch(r"[A-Za-z0-9_]{2,40}", value):
+            _send_add_step(chat_id, "add_name", data, err="الاسم إنجليزي بدون مسافات (2–40: حروف/أرقام/_).")
+            return
+        data["name"] = value
+        _set_state(user["id"], "add_package", data)
+        _send_add_step(chat_id, "add_package", data)
+    elif step == "add_package":
+        if "." not in value or not re.fullmatch(r"[A-Za-z0-9_.]{3,80}", value):
+            _send_add_step(chat_id, "add_package", data, err="حزمة غير صالحة. مثال: com.example.app")
+            return
+        data["package"] = value
+        _set_state(user["id"], "add_devkey", data)
+        _send_add_step(chat_id, "add_devkey", data)
+    elif step == "add_devkey":
+        if len(value) < 6:
+            _send_add_step(chat_id, "add_devkey", data, err="Dev Key قصير جداً.")
+            return
+        data["dev_key"] = value
+        _set_state(user["id"], "add_events", data)
+        _send_add_step(chat_id, "add_events", data)
+    elif step == "add_events":
+        evs = [e.strip() for e in value.split(",") if e.strip()]
+        if not evs:
+            _send_add_step(chat_id, "add_events", data, err="أرسل اسم حدث واحداً على الأقل.")
+            return
+        data["events"] = evs
+        _set_state(user["id"], "awaiting_confirm", data)
+        _send_review(chat_id, user, data)
+
+
+def _save_add_job(user, data):
+    """يُدرج المهمة في scheduled_jobs (نفس منطق DB). run_at=NOW() ⇒ تُنفَّذ بأقرب مسح."""
+    env = _get_env(user["id"])
+    os_ = (env.get("os") or "").lower()
+    device_id = env.get("idfa", "") if os_ == "ios" else env.get("gaid", "")
+    p_host, p_port, p_user, p_pass = _proxy_parts(env.get("proxy", ""))
+    events = json.dumps([{"name": e} for e in data["events"]])
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO scheduled_jobs
+                         (user_id, name, events, package, dev_key, gaid, afid,
+                          proxy_host, proxy_port, proxy_user, proxy_pass, run_at, enabled)
+                       VALUES (%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s, NOW(), 1)
+                       RETURNING id""",
+                    (user["id"], data["name"], events, data["package"], data["dev_key"],
+                     device_id, env.get("afid", ""), p_host, p_port, p_user, p_pass),
+                )
+                return cur.fetchone()["id"]
+    except Exception as e:
+        logger.error(f"[Telegram] /add save failed: {e}")
+        return None
+
+
+# ── دوال مشتركة للقائمة الرئيسية (يستخدمها الأمر والزر معاً) ──────────────────
+def _settings_kb(uid):
+    on = _get_notify(uid)
+    kb = types.InlineKeyboardMarkup()
+    kb.row(types.InlineKeyboardButton(
+        f"إشعارات النتائج: {'مفعّلة ✅' if on else 'موقوفة ⛔'}",
+        callback_data="settings:toggle",
+    ))
+    return kb
+
+
+def _open_apps(chat_id, user):
+    if not GAMES_DATA:
+        bot.send_message(chat_id, "لا توجد تطبيقات مُعرّفة بعد.")
+        return
+    kb = types.InlineKeyboardMarkup()
+    row = []
+    for i, app_cfg in enumerate(GAMES_DATA):
+        row.append(types.InlineKeyboardButton(app_cfg["name"], callback_data=f"app:{i}"))
+        if len(row) == 2:
+            kb.row(*row); row = []
+    if row:
+        kb.row(*row)
+    bot.send_message(chat_id, "اختر التطبيق للاختبار:", reply_markup=kb)
+
+
+def _open_profile(chat_id, user):
+    env = _get_env(user["id"])
+    os_ = env.get("os", "—")
+    dev_id = env.get("idfa", "") if os_ == "ios" else env.get("gaid", "")
+    dev_lbl = "IDFA" if os_ == "ios" else "GAID"
+    txt = (
+        f"🧪 بيئة اختبار {user['username']}\n\n"
+        f"النظام: {os_ or '—'}\n"
+        f"{dev_lbl}: {dev_id or '—'}\n"
+        f"AFID: {env.get('afid','') or '—'}\n"
+        f"البروكسي: {env.get('proxy','') or '—'}"
+    )
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton("📱 تحديث الجهاز", callback_data="profile:device"),
+        types.InlineKeyboardButton("🌐 تحديث البروكسي", callback_data="profile:proxy"),
+    )
+    bot.send_message(chat_id, txt, reply_markup=kb)
+
+
+MAIN_MENU_LABELS = {
+    "➕ مهمة جديدة": "add",
+    "🧪 التطبيقات":  "apps",
+    "👤 حسابي":      "profile",
+    "⚙️ الإعدادات":  "settings",
+    "📊 رصيدي":      "balance",
+}
+
+
+def _main_menu_kb():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("➕ مهمة جديدة", "🧪 التطبيقات")
+    kb.row("👤 حسابي", "⚙️ الإعدادات")
+    kb.row("📊 رصيدي")
+    return kb
+
+
 def _register_handlers():
     if not bot:
         return
@@ -435,21 +659,27 @@ def _register_handlers():
                 bot.reply_to(m, f"✅ تم ربط حسابك {u['username']}.\n/apps للبدء.")
                 return
         if u:
-            bot.reply_to(m, f"مرحباً {u['username']} 👋\nالرصيد: {u['uses_left']}/{u['max_uses']}\n/apps للبدء.")
+            bot.send_message(
+                m.chat.id,
+                f"مرحباً {u['username']} 👋\nالرصيد: {u['uses_left']}/{u['max_uses']}",
+                reply_markup=_main_menu_kb(),
+            )
             return
         u = _auto_register(m.chat.id, m.from_user.username, m.from_user.first_name)
-        bot.reply_to(
-            m,
+        bot.send_message(
+            m.chat.id,
             f"أهلاً {u['username']} 👋\nتم إنشاء حسابك.\n🎁 رصيدك المجاني: {u['uses_left']} اختبارات.\n\n"
-            f"1) أعدّ جهازك: /profile\n2) ابدأ اختباراً: /apps",
+            f"1) أعدّ جهازك: /profile\n2) ابدأ اختباراً: /apps أو ➕ مهمة جديدة",
+            reply_markup=_main_menu_kb(),
         )
 
     @bot.message_handler(commands=["help"])
     def h_help(m):
         bot.reply_to(
             m,
-            "الأوامر:\n/profile — بيئة الاختبار (جهاز/بروكسي)\n/settings — الإشعارات\n"
-            "/apps — بدء اختبار\n/balance — الرصيد\n/history — السجلّ\n/status — حالتك\n/unlink — فكّ الربط",
+            "الأوامر:\n/add — إنشاء مهمة مجدولة (خطوات)\n/apps — بدء اختبار سريع\n"
+            "/profile — بيئة الاختبار (جهاز/بروكسي)\n/settings — الإشعارات\n"
+            "/balance — الرصيد\n/history — السجلّ\n/status — حالتك\n/unlink — فكّ الربط",
         )
 
     @bot.message_handler(commands=["unlink"])
@@ -490,23 +720,7 @@ def _register_handlers():
     @bot.message_handler(commands=["profile"])
     @linked
     def h_profile(m, u):
-        env = _get_env(u["id"])
-        os_ = env.get("os", "—")
-        dev_id = env.get("idfa", "") if os_ == "ios" else env.get("gaid", "")
-        dev_lbl = "IDFA" if os_ == "ios" else "GAID"
-        txt = (
-            f"🧪 بيئة اختبار {u['username']}\n\n"
-            f"النظام: {os_ or '—'}\n"
-            f"{dev_lbl}: {dev_id or '—'}\n"
-            f"AFID: {env.get('afid','') or '—'}\n"
-            f"البروكسي: {env.get('proxy','') or '—'}"
-        )
-        kb = types.InlineKeyboardMarkup()
-        kb.row(
-            types.InlineKeyboardButton("📱 تحديث الجهاز", callback_data="profile:device"),
-            types.InlineKeyboardButton("🌐 تحديث البروكسي", callback_data="profile:proxy"),
-        )
-        bot.send_message(m.chat.id, txt, reply_markup=kb)
+        _open_profile(m.chat.id, u)
 
     @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("profile:"))
     def h_profile_cb(c):
@@ -548,15 +762,6 @@ def _register_handlers():
             bot.send_message(c.message.chat.id, "أرسل IDFA:", reply_markup=types.ForceReply(selective=False))
 
     # ── /settings ────────────────────────────────────────────────────────────
-    def _settings_kb(uid):
-        on = _get_notify(uid)
-        kb = types.InlineKeyboardMarkup()
-        kb.row(types.InlineKeyboardButton(
-            f"إشعارات النتائج: {'مفعّلة ✅' if on else 'موقوفة ⛔'}",
-            callback_data="settings:toggle",
-        ))
-        return kb
-
     @bot.message_handler(commands=["settings"])
     @linked
     def h_settings(m, u):
@@ -579,19 +784,93 @@ def _register_handlers():
     @bot.message_handler(commands=["apps"])
     @linked
     def h_apps(m, u):
-        if not GAMES_DATA:
-            bot.reply_to(m, "لا توجد تطبيقات مُعرّفة بعد.")
+        _open_apps(m.chat.id, u)
+
+    # ── /add — إنشاء مهمة مجدولة بخطوات ──────────────────────────────────────
+    @bot.message_handler(commands=["add"])
+    @linked
+    def h_add(m, u):
+        _set_state(u["id"], "add_name", {})
+        _send_add_step(m.chat.id, "add_name", {})
+
+    @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("add:"))
+    def h_add_cb(c):
+        u = _user_by_chat(c.message.chat.id)
+        if not u:
+            bot.answer_callback_query(c.id, "أرسل /start أولاً")
             return
-        kb = types.InlineKeyboardMarkup()
-        row = []
-        for i, app_cfg in enumerate(GAMES_DATA):
-            row.append(types.InlineKeyboardButton(app_cfg["name"], callback_data=f"app:{i}"))
-            if len(row) == 2:
-                kb.row(*row)
-                row = []
-        if row:
-            kb.row(*row)
-        bot.send_message(m.chat.id, "اختر التطبيق للاختبار:", reply_markup=kb)
+        action = c.data.split(":", 1)[1]
+        if action == "cancel":
+            _clear_state(u["id"])
+            bot.answer_callback_query(c.id, "أُلغي")
+            bot.send_message(c.message.chat.id, "❌ تم إلغاء إنشاء المهمة.")
+            return
+        if action == "restart":
+            _set_state(u["id"], "add_name", {})
+            bot.answer_callback_query(c.id)
+            _send_add_step(c.message.chat.id, "add_name", {})
+            return
+        if action == "back":
+            step, data = _get_state(u["id"])
+            prev = _ADD_PREV.get(step)
+            bot.answer_callback_query(c.id)
+            if prev:
+                _set_state(u["id"], prev, data)
+                _send_add_step(c.message.chat.id, prev, data)
+            return
+        if action == "save":
+            step, data = _get_state(u["id"])
+            if step != "awaiting_confirm":
+                bot.answer_callback_query(c.id, "انتهت الجلسة")
+                return
+            if not all(data.get(k) for k in ("name", "package", "dev_key", "events")):
+                _clear_state(u["id"])
+                bot.answer_callback_query(c.id)
+                bot.send_message(c.message.chat.id, "بيانات ناقصة. أعد /add.")
+                return
+            jid = _save_add_job(u, data)
+            _clear_state(u["id"])
+            bot.answer_callback_query(c.id, "تم الحفظ")
+            if jid:
+                env = _get_env(u["id"])
+                ready = (env.get("os") and (env.get("gaid") or env.get("idfa")) and env.get("afid"))
+                note = "" if ready else "\n\n⚠️ بيئة جهازك غير مكتملة — أكملها عبر /profile قبل التشغيل."
+                bot.send_message(
+                    c.message.chat.id,
+                    f"✅ <b>تم حفظ المهمة</b> (#{jid}).\nستُنفَّذ خلال دقيقة عند أقرب مسح.{note}",
+                    parse_mode="HTML",
+                )
+            else:
+                bot.send_message(c.message.chat.id, "❌ تعذّر حفظ المهمة. حاول لاحقاً.")
+            return
+        if action.startswith("exv:"):
+            value = action[len("exv:"):]
+            bot.answer_callback_query(c.id)
+            _add_advance(c.message.chat.id, u, value)
+            return
+
+    # ── القائمة الرئيسية (ReplyKeyboard) — تربط الأزرار بالأوامر ──────────────
+    @bot.message_handler(
+        func=lambda m: bool(m.text) and m.text in MAIN_MENU_LABELS and _text_step(m.chat.id) is None,
+        content_types=["text"],
+    )
+    def h_menu(m):
+        u = _user_by_chat(m.chat.id)
+        if not u:
+            bot.reply_to(m, "أرسل /start أولاً.")
+            return
+        target = MAIN_MENU_LABELS[m.text]
+        if target == "add":
+            _set_state(u["id"], "add_name", {})
+            _send_add_step(m.chat.id, "add_name", {})
+        elif target == "apps":
+            _open_apps(m.chat.id, u)
+        elif target == "profile":
+            _open_profile(m.chat.id, u)
+        elif target == "settings":
+            bot.send_message(m.chat.id, "⚙️ الإعدادات:", reply_markup=_settings_kb(u["id"]))
+        elif target == "balance":
+            bot.send_message(m.chat.id, f"💳 رصيدك: {u['uses_left']} من {u['max_uses']}")
 
     @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("app:"))
     def h_app_pick(c):
@@ -692,6 +971,11 @@ def _register_handlers():
         step, data = _get_state(u["id"])
         text = (m.text or "").strip()
         try:
+            # مسار /add متعدّد الخطوات (تحقّق ذاتي داخل _add_advance)
+            if step in ("add_name", "add_package", "add_devkey", "add_events"):
+                _add_advance(m.chat.id, u, text)
+                return
+
             # رفض الإدخال الفارغ للخطوات التي تتطلّب قيمة (نُبقي الحالة لإعادة المحاولة)
             if step in ("device_gaid", "device_idfa", "device_afid", "app_value") and not text:
                 bot.reply_to(m, "القيمة فارغة. أرسل قيمة صحيحة:",
