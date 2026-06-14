@@ -173,8 +173,11 @@ def _get_env(user_id) -> dict:
 
 
 def _save_env(user_id, **fields):
+    """يحفظ الحقول غير الفارغة فقط (يتجاهل None و'' والمسافات) — يمنع تلويث البيئة."""
     env = _get_env(user_id)
-    env.update({k: v for k, v in fields.items() if v is not None})
+    for k, v in fields.items():
+        if v is not None and str(v).strip():
+            env[k] = str(v).strip()
     _ud_set(user_id, "tg_env", json.dumps(env))
 
 
@@ -241,10 +244,41 @@ def _proxy_parts(s):
 # ═══════════════════════════════════════════════════════════════════════════════
 # إرسال الحدث — يسحب بيانات المختبِر ديناميكياً
 # ═══════════════════════════════════════════════════════════════════════════════
+def _missing_requirements(app_cfg, env):
+    """
+    بوابة الصدّ: تعيد قائمة الحقول الناقصة لتنفيذ اختبار صالح.
+    قائمة فارغة = جاهز. تمنع تلويث scheduled_jobs أو إرسال Payload فارغ.
+    """
+    missing = []
+    if not (app_cfg.get("dev_key") or _default_dev_key() or "").strip():
+        missing.append("dev_key")            # إعداد مشرف (ليس من المستخدم)
+    os_ = (env.get("os") or "").strip().lower()
+    if os_ not in ("android", "ios"):
+        missing.append("نظام التشغيل")
+    elif os_ == "ios" and not (env.get("idfa") or "").strip():
+        missing.append("IDFA")
+    elif os_ == "android" and not (env.get("gaid") or "").strip():
+        missing.append("GAID")
+    if not (env.get("afid") or "").strip():
+        missing.append("AFID")
+    return missing
+
+
+def _requirements_message(missing):
+    """رسالة مناسبة: نقص إعداد المشرف (dev_key) أم نقص إعداد جهاز المستخدم."""
+    if "dev_key" in missing:
+        return "⚠️ هذا التطبيق غير مُهيّأ للإرسال بعد (مفتاح التطوير مفقود). تواصل مع المشرف."
+    return "⚙️ أكمل إعداد جهازك عبر /profile.\nينقص: " + "، ".join(missing)
+
+
 def _dispatch_event(app_cfg, value, user, env):
     """يرسل حدث AppsFlyer ببيانات المختبِر. يعيد (ok, info, transport_error)."""
     package = app_cfg["package"]
     dev_key = app_cfg.get("dev_key") or _default_dev_key()
+    if not (dev_key or "").strip():
+        # دفاع: لا نرسل طلباً بلا مفتاح. transport_error=True ⇒ يُعاد الرصيد.
+        logger.warning(f"[Telegram] dispatch aborted: missing dev_key for {package}")
+        return False, "dev_key مفقود", True
     event_name = app_cfg.get("event", "af_level_achieved")
     os_ = (env.get("os") or "").lower()
 
@@ -282,11 +316,16 @@ def _do_execute_now(chat_id, user, idx, value):
         bot.send_message(chat_id, "انتهت الجلسة. أعد /apps.")
         return
     app_cfg = GAMES_DATA[idx]
+    env = _get_env(user["id"])
+    # بوابة الصدّ: تحقّق قبل خصم الرصيد
+    missing = _missing_requirements(app_cfg, env)
+    if missing:
+        bot.send_message(chat_id, _requirements_message(missing))
+        return
     ok_bal, left = _consume_use(user)
     if not ok_bal:
         bot.send_message(chat_id, "🚫 عذراً، نفد رصيدك.")
         return
-    env = _get_env(user["id"])
     bot.send_chat_action(chat_id, "typing")
     ok, info, transport_err = _dispatch_event(app_cfg, value, user, env)
     if not ok and transport_err:
@@ -312,15 +351,25 @@ def _parse_delay_minutes(text):
 
 
 def _schedule_test(user, idx, value, minutes):
-    """يخصم الرصيد مقدماً ويسجّل المهمة في scheduled_jobs. يعيد (ok, run_at_or_error)."""
+    """
+    يجدول اختباراً. يعيد (status, payload):
+      ("ok", run_at) | ("invalid", missing_list) | ("balance", None)
+      | ("session", None) | ("db", None)
+    يتحقّق من الجاهزية قبل خصم الرصيد أو الإدراج (لا تلويث لقاعدة البيانات).
+    """
     if idx < 0 or idx >= len(GAMES_DATA):
-        return False, "session"
+        return "session", None
     app_cfg = GAMES_DATA[idx]
+    env = _get_env(user["id"])
+
+    missing = _missing_requirements(app_cfg, env)
+    if missing:
+        return "invalid", missing
+
     ok_bal, _ = _consume_use(user)
     if not ok_bal:
-        return False, "balance"
+        return "balance", None
 
-    env = _get_env(user["id"])
     event_name = app_cfg.get("event", "af_level_achieved")
     dev_key = app_cfg.get("dev_key") or _default_dev_key()
     os_ = (env.get("os") or "").lower()
@@ -345,11 +394,11 @@ def _schedule_test(user, idx, value, minutes):
                      p_host, p_port, p_user, p_pass, minutes),
                 )
                 run_at = cur.fetchone()["run_at"]
-        return True, run_at
+        return "ok", run_at
     except Exception as e:
-        _refund_use(user)   # فشل التسجيل — أعد الرصيد
+        _refund_use(user)   # فشل الإدراج — أعد الرصيد
         logger.error(f"[Telegram] schedule failed: {e}")
-        return False, "db"
+        return "db", None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -643,6 +692,12 @@ def _register_handlers():
         step, data = _get_state(u["id"])
         text = (m.text or "").strip()
         try:
+            # رفض الإدخال الفارغ للخطوات التي تتطلّب قيمة (نُبقي الحالة لإعادة المحاولة)
+            if step in ("device_gaid", "device_idfa", "device_afid", "app_value") and not text:
+                bot.reply_to(m, "القيمة فارغة. أرسل قيمة صحيحة:",
+                             reply_markup=types.ForceReply(selective=False))
+                return
+
             if step == "device_gaid":
                 data["gaid"] = text
                 _set_state(u["id"], "device_afid", data)
@@ -660,9 +715,16 @@ def _register_handlers():
                 bot.reply_to(m, "✅ تم حفظ بيانات الجهاز. (راجِعها بـ /profile)")
 
             elif step == "proxy":
-                _save_env(u["id"], proxy=text)
+                if text:
+                    _save_env(u["id"], proxy=text)
+                    msg = "✅ تم حفظ البروكسي."
+                else:
+                    env_now = _get_env(u["id"])
+                    env_now.pop("proxy", None)
+                    _ud_set(u["id"], "tg_env", json.dumps(env_now))
+                    msg = "✅ بدون بروكسي (تم التعطيل)."
                 _clear_state(u["id"])
-                bot.reply_to(m, "✅ تم حفظ البروكسي.")
+                bot.reply_to(m, msg)
 
             elif step == "app_value":
                 data["value"] = text
@@ -680,15 +742,17 @@ def _register_handlers():
                     _clear_state(u["id"])
                     bot.reply_to(m, "صيغة غير صحيحة. مثال صحيح: 24h أو 3d.\nأعد /apps للبدء.")
                     return
-                ok, result = _schedule_test(u, data.get("app_index", -1), data.get("value", ""), minutes)
+                status, result = _schedule_test(u, data.get("app_index", -1), data.get("value", ""), minutes)
                 _clear_state(u["id"])
-                if not ok and result == "balance":
-                    bot.reply_to(m, "🚫 نفد رصيدك. تعذّرت الجدولة.")
-                elif not ok:
-                    bot.reply_to(m, "تعذّرت الجدولة (انتهت الجلسة أو خطأ). أعد /apps.")
-                else:
+                if status == "ok":
                     when_txt = result.strftime("%Y-%m-%d %H:%M UTC") if hasattr(result, "strftime") else str(result)
                     bot.reply_to(m, f"🗓 تمت جدولة الاختبار.\nموعد التنفيذ: {when_txt}\nخُصم من رصيدك مقدّماً.")
+                elif status == "invalid":
+                    bot.reply_to(m, _requirements_message(result))
+                elif status == "balance":
+                    bot.reply_to(m, "🚫 نفد رصيدك. تعذّرت الجدولة.")
+                else:
+                    bot.reply_to(m, "تعذّرت الجدولة. أعد /apps.")
             else:
                 _clear_state(u["id"])
         except Exception as e:
