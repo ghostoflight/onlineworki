@@ -1,15 +1,18 @@
 """
-bot/telegram_bot.py — بوت تلغرام مشترك تفاعلي (Webhook)
+bot/telegram_bot.py — منصّة اختبار جودة (QA) ذاتية الخدمة عبر تلغرام
+
+مبنيّة على Webhook + Flask، وكل حالة المحادثة مخزّنة في user_data (مفتاح موحّد
+tg_state) لتعمل مع عدّة عمّال Gunicorn.
 
 الميزات:
-  • /start: تسجيل تلقائي — إن لم يكن chat_id موجوداً يُنشأ مستخدم جديد
-    (role=user, max_uses=5, uses_left=5). يدعم أيضاً /start <code> لربط حساب قائم.
-  • /apps: لوحة أزرار ديناميكية من games_config.GAMES_DATA.
-  • حالة المحادثة (State): بعد اختيار تطبيق يطلب البوت القيمة، ويلتقط الرد عبر
-    حالة مخزّنة في قاعدة البيانات (تعمل مع عدّة عمّال gunicorn — لا ذاكرة محلية).
-  • التنفيذ + خصم الرصيد: فحص uses_left، خصم ذرّي، إرسال الحدث (نفس منطق
-    proxy_send_event)، ثم تقرير النجاح/الفشل. إعادة الرصيد تلقائياً عند فشل الوصول.
-  • /balance و /history و /status: تقرأ بناءً على tg_chat_id مباشرة.
+  • /start  : تسجيل تلقائي برصيد مجاني (+ ربط حساب قائم عبر /start <code>).
+  • /profile: عرض بيئة المختبِر + أزرار (تحديث الجهاز Android/iOS، تحديث البروكسي).
+  • /settings: تفعيل/إيقاف إشعارات نتائج الاختبار (notify_enabled).
+  • /apps   : اختيار تطبيق ← إدخال القيمة ← متى التنفيذ؟ (فوري / جدولة مخصّصة).
+  • التنفيذ يسحب بيانات المختبِر (OS, GAID/IDFA, AFID, Proxy) من قاعدة البيانات.
+  • /balance /history /status /unlink /help.
+
+كل مدخل نصّي محميّ بـ try/except مع تنظيف الحالة حتى لا يعلق المستخدم.
 
 التوافق: register_webhook(app) و maybe_setup_webhook() كما هي (يستوردهما web.py).
 """
@@ -33,14 +36,12 @@ from tasks.job_tasks import execute_job, _build_proxies, _log_event_history
 
 logger = logging.getLogger(__name__)
 
-# قائمة التطبيقات (من ملف خارجي)
 try:
     from games_config import GAMES_DATA
 except Exception:
     GAMES_DATA = []
-    logger.warning("[Telegram] games_config.GAMES_DATA غير موجود — /apps سيكون فارغاً")
+    logger.warning("[Telegram] games_config.GAMES_DATA غير موجود — /apps فارغ")
 
-# ─── إنشاء البوت ─────────────────────────────────────────────────────────────
 bot: telebot.TeleBot | None = None
 if config.TELEGRAM_BOT_TOKEN:
     bot = telebot.TeleBot(config.TELEGRAM_BOT_TOKEN, threaded=False)
@@ -48,162 +49,217 @@ if config.TELEGRAM_BOT_TOKEN:
 else:
     logger.info("[Telegram] TELEGRAM_BOT_TOKEN not set — bot disabled.")
 
-FREE_USES = 5  # الرصيد المجاني للمستخدم الجديد
+FREE_USES = 5
+# خطوات تتطلّب إدخالاً نصّياً (تُلتقط بمعالج النص)
+TEXT_STEPS = {"device_gaid", "device_idfa", "device_afid", "proxy", "app_value", "schedule_delay"}
+
+
+def _default_dev_key() -> str:
+    return getattr(config, "DEFAULT_DEV_KEY", "") or os.environ.get("DEFAULT_DEV_KEY", "")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# مساعدات قاعدة البيانات
+# مستخدمون
 # ═══════════════════════════════════════════════════════════════════════════════
 def _user_by_chat(chat_id) -> dict | None:
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT * FROM users WHERE tg_chat_id = %s AND active = 1",
-                (str(chat_id),),
-            )
+            cur.execute("SELECT * FROM users WHERE tg_chat_id = %s AND active = 1", (str(chat_id),))
             return cur.fetchone()
 
 
-def _auto_register(chat_id, tg_username: str | None, first_name: str | None) -> dict:
-    """ينشئ مستخدماً جديداً مرتبطاً بمحادثة تلغرام برصيد مجاني."""
+def _auto_register(chat_id, tg_username, first_name) -> dict:
     raw = (tg_username or first_name or f"tg{chat_id}").strip()
     base = re.sub(r"[^\w]", "_", raw)[:40] or f"tg{chat_id}"
-    pw = hashlib.sha256(os.urandom(16)).hexdigest()  # كلمة مرور عشوائية (لا تُستخدم للويب)
-
-    candidates = [base, f"{base}_{chat_id}", f"{base}_{hashlib.sha1(os.urandom(4)).hexdigest()[:4]}"]
-    for uname in candidates:
+    pw = hashlib.sha256(os.urandom(16)).hexdigest()
+    for uname in (base, f"{base}_{chat_id}", f"{base}_{hashlib.sha1(os.urandom(4)).hexdigest()[:4]}"):
         try:
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        """INSERT INTO users
-                               (username, password, role, max_uses, uses_left, active, tg_chat_id)
-                           VALUES (%s, %s, 'user', %s, %s, 1, %s)
-                           RETURNING *""",
+                        """INSERT INTO users (username, password, role, max_uses, uses_left, active, tg_chat_id)
+                           VALUES (%s, %s, 'user', %s, %s, 1, %s) RETURNING *""",
                         (uname, pw, FREE_USES, FREE_USES, str(chat_id)),
                     )
                     return cur.fetchone()
         except psycopg2.IntegrityError:
-            continue  # تعارض اسم المستخدم — جرّب البديل التالي
-    # احتمال نادر جداً: أعِد المستخدم إن أُنشئ في سباق متزامن
+            continue
     existing = _user_by_chat(chat_id)
     if existing:
         return existing
     raise RuntimeError("auto-register failed")
 
 
-def _consume_link_code(code: str) -> int | None:
+def _consume_link_code(code: str):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT user_id FROM user_data WHERE key = 'tg_link_code' AND value = %s",
-                (code,),
-            )
+            cur.execute("SELECT user_id FROM user_data WHERE key='tg_link_code' AND value=%s", (code,))
             row = cur.fetchone()
             if not row:
                 return None
             uid = row["user_id"]
-            cur.execute(
-                "DELETE FROM user_data WHERE user_id = %s AND key = 'tg_link_code'",
-                (uid,),
-            )
+            cur.execute("DELETE FROM user_data WHERE user_id=%s AND key='tg_link_code'", (uid,))
             return uid
 
 
-def _set_chat(user_id: int, chat_id) -> None:
+def _set_chat(user_id, chat_id):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE users SET tg_chat_id = %s WHERE id = %s", (str(chat_id), user_id))
+            cur.execute("UPDATE users SET tg_chat_id=%s WHERE id=%s", (str(chat_id), user_id))
 
 
-def _clear_chat(chat_id) -> None:
+def _clear_chat(chat_id):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE users SET tg_chat_id = NULL WHERE tg_chat_id = %s", (str(chat_id),))
+            cur.execute("UPDATE users SET tg_chat_id=NULL WHERE tg_chat_id=%s", (str(chat_id),))
 
 
-# ─── حالة المحادثة (مخزّنة في user_data — تعمل مع عدّة عمّال) ─────────────────
-def _set_pending(user_id: int, app_index: int) -> None:
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO user_data (user_id, key, value, updated)
-                   VALUES (%s, 'tg_pending_app', %s, NOW())
-                   ON CONFLICT (user_id, key)
-                   DO UPDATE SET value = EXCLUDED.value, updated = NOW()""",
-                (user_id, str(app_index)),
-            )
-
-
-def _get_pending(user_id: int) -> int | None:
+# ═══════════════════════════════════════════════════════════════════════════════
+# user_data: حالة + بيئة + إعدادات
+# ═══════════════════════════════════════════════════════════════════════════════
+def _ud_set(user_id, key, value):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT value FROM user_data WHERE user_id = %s AND key = 'tg_pending_app'",
-                (user_id,),
+                """INSERT INTO user_data (user_id, key, value, updated) VALUES (%s,%s,%s,NOW())
+                   ON CONFLICT (user_id, key) DO UPDATE SET value=EXCLUDED.value, updated=NOW()""",
+                (user_id, key, value),
             )
+
+
+def _ud_get(user_id, key):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM user_data WHERE user_id=%s AND key=%s", (user_id, key))
             row = cur.fetchone()
-    if not row:
-        return None
-    try:
-        return int(row["value"])
-    except (TypeError, ValueError):
-        return None
+    return row["value"] if row else None
 
 
-def _clear_pending(user_id: int) -> None:
+def _ud_del(user_id, key):
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM user_data WHERE user_id = %s AND key = 'tg_pending_app'",
-                (user_id,),
-            )
+            cur.execute("DELETE FROM user_data WHERE user_id=%s AND key=%s", (user_id, key))
 
 
-# ─── الرصيد ──────────────────────────────────────────────────────────────────
-def _consume_use(user: dict):
-    """خصم ذرّي لاستخدام واحد. يعيد (نجح؟, الرصيد المتبقي)."""
+# ── الحالة (state machine) ───────────────────────────────────────────────────
+def _set_state(user_id, step, data=None):
+    _ud_set(user_id, "tg_state", json.dumps({"step": step, "data": data or {}}))
+
+
+def _get_state(user_id):
+    raw = _ud_get(user_id, "tg_state")
+    if not raw:
+        return None, {}
+    try:
+        obj = json.loads(raw)
+        return obj.get("step"), obj.get("data", {})
+    except Exception:
+        return None, {}
+
+
+def _clear_state(user_id):
+    _ud_del(user_id, "tg_state")
+
+
+# ── بيئة المختبِر ─────────────────────────────────────────────────────────────
+def _get_env(user_id) -> dict:
+    raw = _ud_get(user_id, "tg_env")
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except Exception:
+        return {}
+
+
+def _save_env(user_id, **fields):
+    env = _get_env(user_id)
+    env.update({k: v for k, v in fields.items() if v is not None})
+    _ud_set(user_id, "tg_env", json.dumps(env))
+
+
+# ── إشعارات ───────────────────────────────────────────────────────────────────
+def _get_notify(user_id) -> bool:
+    return (_ud_get(user_id, "notify_enabled") or "1") == "1"
+
+
+def _set_notify(user_id, enabled: bool):
+    _ud_set(user_id, "notify_enabled", "1" if enabled else "0")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# الرصيد
+# ═══════════════════════════════════════════════════════════════════════════════
+def _consume_use(user):
     if user["role"] == "admin":
         return True, user["uses_left"]
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "UPDATE users SET uses_left = uses_left - 1 WHERE id = %s AND uses_left > 0 RETURNING uses_left",
+                "UPDATE users SET uses_left = uses_left - 1 WHERE id=%s AND uses_left > 0 RETURNING uses_left",
                 (user["id"],),
             )
             row = cur.fetchone()
     return (True, row["uses_left"]) if row else (False, 0)
 
 
-def _refund_use(user: dict) -> None:
+def _refund_use(user):
     if user["role"] == "admin":
         return
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE users SET uses_left = uses_left + 1 WHERE id = %s", (user["id"],))
+            cur.execute("UPDATE users SET uses_left = uses_left + 1 WHERE id=%s", (user["id"],))
 
 
-# ─── إرسال الحدث (نفس منطق proxy_send_event، بلا استيراد دائري) ───────────────
-def _dispatch_event(app_cfg: dict, value: str, user: dict):
-    """
-    يرسل حدث AppsFlyer لتطبيق معيّن.
-    يعيد (ok, info, transport_error) — transport_error=True يعني لم يصل الطلب.
-    """
+# ═══════════════════════════════════════════════════════════════════════════════
+# Proxy helpers
+# ═══════════════════════════════════════════════════════════════════════════════
+def _proxies_from_string(s):
+    s = (s or "").strip()
+    if not s:
+        return None
+    url = s if "://" in s else f"http://{s}"
+    return {"http": url, "https": url}
+
+
+def _proxy_parts(s):
+    s = (s or "").strip()
+    if not s:
+        return "", "", "", ""
+    if "://" in s:
+        s = s.split("://", 1)[1]
+    user = pw = ""
+    if "@" in s:
+        creds, _, hostport = s.partition("@")
+        user, _, pw = creds.partition(":")
+    else:
+        hostport = s
+    host, _, port = hostport.partition(":")
+    return host, port, user, pw
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# إرسال الحدث — يسحب بيانات المختبِر ديناميكياً
+# ═══════════════════════════════════════════════════════════════════════════════
+def _dispatch_event(app_cfg, value, user, env):
+    """يرسل حدث AppsFlyer ببيانات المختبِر. يعيد (ok, info, transport_error)."""
     package = app_cfg["package"]
-    dev_key = (
-        app_cfg.get("dev_key")
-        or getattr(config, "DEFAULT_DEV_KEY", "")
-        or os.environ.get("DEFAULT_DEV_KEY", "")
-    )
+    dev_key = app_cfg.get("dev_key") or _default_dev_key()
     event_name = app_cfg.get("event", "af_level_achieved")
+    os_ = (env.get("os") or "").lower()
+
     body = {
-        "appsflyer_id":   app_cfg.get("afid", ""),
-        "advertising_id": app_cfg.get("gaid", ""),
-        "eventName":      event_name,
-        "eventTime":      datetime.now(timezone.utc).isoformat(),
-        "eventValue":     json.dumps({"value": value}),
+        "appsflyer_id": env.get("afid", "") or app_cfg.get("afid", ""),
+        "eventName": event_name,
+        "eventTime": datetime.now(timezone.utc).isoformat(),
+        "eventValue": json.dumps({"value": value}),
     }
-    proxies = _build_proxies(
+    if os_ == "ios":
+        body["idfa"] = env.get("idfa", "")
+    else:
+        body["advertising_id"] = env.get("gaid", "") or app_cfg.get("gaid", "")
+
+    proxies = _proxies_from_string(env.get("proxy", "")) or _build_proxies(
         app_cfg.get("proxy_host", ""), app_cfg.get("proxy_port", ""),
         app_cfg.get("proxy_user", ""), app_cfg.get("proxy_pass", ""),
     )
@@ -221,8 +277,83 @@ def _dispatch_event(app_cfg: dict, value: str, user: dict):
         return False, str(e)[:80], True
 
 
+def _do_execute_now(chat_id, user, idx, value):
+    if idx < 0 or idx >= len(GAMES_DATA):
+        bot.send_message(chat_id, "انتهت الجلسة. أعد /apps.")
+        return
+    app_cfg = GAMES_DATA[idx]
+    ok_bal, left = _consume_use(user)
+    if not ok_bal:
+        bot.send_message(chat_id, "🚫 عذراً، نفد رصيدك.")
+        return
+    env = _get_env(user["id"])
+    bot.send_chat_action(chat_id, "typing")
+    ok, info, transport_err = _dispatch_event(app_cfg, value, user, env)
+    if not ok and transport_err:
+        _refund_use(user)
+        left += 1
+    if ok:
+        bot.send_message(chat_id, f"✅ تم تنفيذ الاختبار.\n{app_cfg['name']} · القيمة: {value}\nالرصيد: {left}")
+    else:
+        bot.send_message(chat_id, f"❌ فشل التنفيذ ({info}).\nالرصيد: {left}")
+
+
+_DELAY_RE = re.compile(r"^\s*(\d+)\s*([hHdD])\s*$")
+
+
+def _parse_delay_minutes(text):
+    m = _DELAY_RE.match(text or "")
+    if not m:
+        return None
+    n, unit = int(m.group(1)), m.group(2).lower()
+    if n <= 0:
+        return None
+    return n * 60 if unit == "h" else n * 1440
+
+
+def _schedule_test(user, idx, value, minutes):
+    """يخصم الرصيد مقدماً ويسجّل المهمة في scheduled_jobs. يعيد (ok, run_at_or_error)."""
+    if idx < 0 or idx >= len(GAMES_DATA):
+        return False, "session"
+    app_cfg = GAMES_DATA[idx]
+    ok_bal, _ = _consume_use(user)
+    if not ok_bal:
+        return False, "balance"
+
+    env = _get_env(user["id"])
+    event_name = app_cfg.get("event", "af_level_achieved")
+    dev_key = app_cfg.get("dev_key") or _default_dev_key()
+    os_ = (env.get("os") or "").lower()
+    device_id = env.get("idfa", "") if os_ == "ios" else env.get("gaid", "")
+    p_host, p_port, p_user, p_pass = _proxy_parts(env.get("proxy", ""))
+    name = f"{app_cfg['name']} · {event_name}={value}"
+    events = json.dumps([{"name": event_name}])
+
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO scheduled_jobs
+                         (user_id, name, events, package, dev_key, gaid, afid,
+                          proxy_host, proxy_port, proxy_user, proxy_pass,
+                          run_at, enabled)
+                       VALUES (%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,
+                               NOW() + make_interval(mins => %s), 1)
+                       RETURNING run_at""",
+                    (user["id"], name, events, app_cfg["package"], dev_key,
+                     device_id, env.get("afid", ""),
+                     p_host, p_port, p_user, p_pass, minutes),
+                )
+                run_at = cur.fetchone()["run_at"]
+        return True, run_at
+    except Exception as e:
+        _refund_use(user)   # فشل التسجيل — أعد الرصيد
+        logger.error(f"[Telegram] schedule failed: {e}")
+        return False, "db"
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
-# Decorator: أوامر تتطلّب حساباً
+# Decorator
 # ═══════════════════════════════════════════════════════════════════════════════
 def linked(handler):
     @wraps(handler)
@@ -242,56 +373,40 @@ def _register_handlers():
     if not bot:
         return
 
-    # ── /start: ربط أو تسجيل تلقائي ──────────────────────────────────────────
+    # ── /start ───────────────────────────────────────────────────────────────
     @bot.message_handler(commands=["start"])
     def h_start(m):
         parts = (m.text or "").split(maxsplit=1)
         u = _user_by_chat(m.chat.id)
-
-        # ربط حساب قائم عبر رمز (اختياري — يبقي تدفّق الويب يعمل)
         if not u and len(parts) == 2:
             uid = _consume_link_code(parts[1].strip().upper())
             if uid:
                 _set_chat(uid, m.chat.id)
                 u = _user_by_chat(m.chat.id)
-                bot.reply_to(m, f"✅ تم ربط حسابك {u['username']}.\nاكتب /apps للبدء.")
+                bot.reply_to(m, f"✅ تم ربط حسابك {u['username']}.\n/apps للبدء.")
                 return
-
         if u:
-            bot.reply_to(
-                m,
-                f"مرحباً {u['username']} 👋\n"
-                f"رصيدك: {u['uses_left']}/{u['max_uses']}\n"
-                f"اكتب /apps لعرض التطبيقات.",
-            )
+            bot.reply_to(m, f"مرحباً {u['username']} 👋\nالرصيد: {u['uses_left']}/{u['max_uses']}\n/apps للبدء.")
             return
-
-        # تسجيل تلقائي
         u = _auto_register(m.chat.id, m.from_user.username, m.from_user.first_name)
         bot.reply_to(
             m,
-            f"أهلاً {u['username']} 👋\n"
-            f"تم إنشاء حسابك تلقائياً.\n"
-            f"🎁 رصيدك المجاني: {u['uses_left']} عمليات.\n\n"
-            f"اكتب /apps لاختيار تطبيق والبدء.",
+            f"أهلاً {u['username']} 👋\nتم إنشاء حسابك.\n🎁 رصيدك المجاني: {u['uses_left']} اختبارات.\n\n"
+            f"1) أعدّ جهازك: /profile\n2) ابدأ اختباراً: /apps",
         )
 
     @bot.message_handler(commands=["help"])
     def h_help(m):
         bot.reply_to(
             m,
-            "الأوامر:\n"
-            "/apps — التطبيقات المتاحة\n"
-            "/balance — رصيدك\n"
-            "/history — آخر العمليات\n"
-            "/status — حالتك\n"
-            "/unlink — فكّ الربط",
+            "الأوامر:\n/profile — بيئة الاختبار (جهاز/بروكسي)\n/settings — الإشعارات\n"
+            "/apps — بدء اختبار\n/balance — الرصيد\n/history — السجلّ\n/status — حالتك\n/unlink — فكّ الربط",
         )
 
     @bot.message_handler(commands=["unlink"])
     def h_unlink(m):
         _clear_chat(m.chat.id)
-        bot.reply_to(m, "تم فكّ ربط هذا الحساب. أرسل /start للبدء مجدداً.")
+        bot.reply_to(m, "تم فكّ الربط. أرسل /start للبدء مجدداً.")
 
     @bot.message_handler(commands=["balance"])
     @linked
@@ -301,10 +416,7 @@ def _register_handlers():
     @bot.message_handler(commands=["status"])
     @linked
     def h_status(m, u):
-        bot.reply_to(
-            m,
-            f"👤 {u['username']}\nالدور: {u['role']}\nالرصيد: {u['uses_left']}/{u['max_uses']}",
-        )
+        bot.reply_to(m, f"👤 {u['username']}\nالدور: {u['role']}\nالرصيد: {u['uses_left']}/{u['max_uses']}")
 
     @bot.message_handler(commands=["history"])
     @linked
@@ -312,11 +424,8 @@ def _register_handlers():
         with get_conn() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """SELECT event_name, status, ok, created_at
-                       FROM event_history WHERE user_id = %s
-                       ORDER BY id DESC LIMIT 8""",
-                    (u["id"],),
-                )
+                    """SELECT event_name, status, ok, created_at FROM event_history
+                       WHERE user_id=%s ORDER BY id DESC LIMIT 8""", (u["id"],))
                 rows = cur.fetchall()
         if not rows:
             bot.reply_to(m, "لا يوجد سجلّ بعد.")
@@ -328,7 +437,96 @@ def _register_handlers():
             lines.append(f"{mark} {r['event_name']} → {r['status']}  {ts}")
         bot.reply_to(m, "آخر العمليات:\n" + "\n".join(lines))
 
-    # ── /apps: لوحة ديناميكية ────────────────────────────────────────────────
+    # ── /profile ─────────────────────────────────────────────────────────────
+    @bot.message_handler(commands=["profile"])
+    @linked
+    def h_profile(m, u):
+        env = _get_env(u["id"])
+        os_ = env.get("os", "—")
+        dev_id = env.get("idfa", "") if os_ == "ios" else env.get("gaid", "")
+        dev_lbl = "IDFA" if os_ == "ios" else "GAID"
+        txt = (
+            f"🧪 بيئة اختبار {u['username']}\n\n"
+            f"النظام: {os_ or '—'}\n"
+            f"{dev_lbl}: {dev_id or '—'}\n"
+            f"AFID: {env.get('afid','') or '—'}\n"
+            f"البروكسي: {env.get('proxy','') or '—'}"
+        )
+        kb = types.InlineKeyboardMarkup()
+        kb.row(
+            types.InlineKeyboardButton("📱 تحديث الجهاز", callback_data="profile:device"),
+            types.InlineKeyboardButton("🌐 تحديث البروكسي", callback_data="profile:proxy"),
+        )
+        bot.send_message(m.chat.id, txt, reply_markup=kb)
+
+    @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("profile:"))
+    def h_profile_cb(c):
+        u = _user_by_chat(c.message.chat.id)
+        if not u:
+            bot.answer_callback_query(c.id, "أرسل /start أولاً")
+            return
+        action = c.data.split(":", 1)[1]
+        if action == "device":
+            bot.answer_callback_query(c.id)
+            kb = types.InlineKeyboardMarkup()
+            kb.row(
+                types.InlineKeyboardButton("🤖 Android", callback_data="os:android"),
+                types.InlineKeyboardButton("🍎 iOS", callback_data="os:ios"),
+            )
+            bot.send_message(c.message.chat.id, "اختر نظام التشغيل لجهاز الاختبار:", reply_markup=kb)
+        elif action == "proxy":
+            _set_state(u["id"], "proxy", {})
+            bot.answer_callback_query(c.id)
+            bot.send_message(
+                c.message.chat.id,
+                "أرسل البروكسي (host:port أو user:pass@host:port):",
+                reply_markup=types.ForceReply(selective=False),
+            )
+
+    @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("os:"))
+    def h_os_cb(c):
+        u = _user_by_chat(c.message.chat.id)
+        if not u:
+            bot.answer_callback_query(c.id, "أرسل /start أولاً")
+            return
+        os_ = c.data.split(":", 1)[1]
+        bot.answer_callback_query(c.id)
+        if os_ == "android":
+            _set_state(u["id"], "device_gaid", {"os": "android"})
+            bot.send_message(c.message.chat.id, "أرسل GAID:", reply_markup=types.ForceReply(selective=False))
+        else:
+            _set_state(u["id"], "device_idfa", {"os": "ios"})
+            bot.send_message(c.message.chat.id, "أرسل IDFA:", reply_markup=types.ForceReply(selective=False))
+
+    # ── /settings ────────────────────────────────────────────────────────────
+    def _settings_kb(uid):
+        on = _get_notify(uid)
+        kb = types.InlineKeyboardMarkup()
+        kb.row(types.InlineKeyboardButton(
+            f"إشعارات النتائج: {'مفعّلة ✅' if on else 'موقوفة ⛔'}",
+            callback_data="settings:toggle",
+        ))
+        return kb
+
+    @bot.message_handler(commands=["settings"])
+    @linked
+    def h_settings(m, u):
+        bot.send_message(m.chat.id, "⚙️ الإعدادات:", reply_markup=_settings_kb(u["id"]))
+
+    @bot.callback_query_handler(func=lambda c: c.data == "settings:toggle")
+    def h_settings_cb(c):
+        u = _user_by_chat(c.message.chat.id)
+        if not u:
+            bot.answer_callback_query(c.id, "أرسل /start أولاً")
+            return
+        _set_notify(u["id"], not _get_notify(u["id"]))
+        bot.answer_callback_query(c.id, "تم التحديث")
+        try:
+            bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=_settings_kb(u["id"]))
+        except Exception:
+            pass
+
+    # ── /apps ────────────────────────────────────────────────────────────────
     @bot.message_handler(commands=["apps"])
     @linked
     def h_apps(m, u):
@@ -344,9 +542,8 @@ def _register_handlers():
                 row = []
         if row:
             kb.row(*row)
-        bot.send_message(m.chat.id, "اختر التطبيق:", reply_markup=kb)
+        bot.send_message(m.chat.id, "اختر التطبيق للاختبار:", reply_markup=kb)
 
-    # ── اختيار تطبيق → طلب القيمة (حالة) ─────────────────────────────────────
     @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("app:"))
     def h_app_pick(c):
         u = _user_by_chat(c.message.chat.id)
@@ -361,15 +558,40 @@ def _register_handlers():
         if idx < 0 or idx >= len(GAMES_DATA):
             bot.answer_callback_query(c.id, "تطبيق غير موجود")
             return
-        _set_pending(u["id"], idx)
+        _set_state(u["id"], "app_value", {"app_index": idx})
         bot.answer_callback_query(c.id)
         bot.send_message(
             c.message.chat.id,
-            f"📲 {GAMES_DATA[idx]['name']}\nيرجى إرسال رقم المستوى/القيمة المطلوبة:",
+            f"📲 {GAMES_DATA[idx]['name']}\nأرسل رقم المستوى/قيمة الحدث:",
             reply_markup=types.ForceReply(selective=False),
         )
 
-    # ── أزرار المهام القديمة (إن وُجدت) ──────────────────────────────────────
+    # ── متى التنفيذ؟ (أزرار) ──────────────────────────────────────────────────
+    @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("when:"))
+    def h_when_cb(c):
+        u = _user_by_chat(c.message.chat.id)
+        if not u:
+            bot.answer_callback_query(c.id, "أرسل /start أولاً")
+            return
+        step, data = _get_state(u["id"])
+        if step != "awaiting_when":
+            bot.answer_callback_query(c.id, "انتهت الجلسة")
+            return
+        choice = c.data.split(":", 1)[1]
+        if choice == "now":
+            _clear_state(u["id"])
+            bot.answer_callback_query(c.id, "تنفيذ فوري")
+            _do_execute_now(c.message.chat.id, u, data.get("app_index", -1), data.get("value", ""))
+        elif choice == "sched":
+            _set_state(u["id"], "schedule_delay", data)
+            bot.answer_callback_query(c.id)
+            bot.send_message(
+                c.message.chat.id,
+                "أدخل مدة التأخير (مثل: 24h أو 3d):",
+                reply_markup=types.ForceReply(selective=False),
+            )
+
+    # ── أزرار المهام القديمة ──────────────────────────────────────────────────
     @bot.callback_query_handler(func=lambda c: (c.data or "").split(":")[0] in ("run", "tog", "del"))
     def h_job_cb(c):
         u = _user_by_chat(c.message.chat.id)
@@ -383,79 +605,107 @@ def _register_handlers():
         jid = int(sid)
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute("SELECT * FROM scheduled_jobs WHERE id = %s", (jid,))
+                cur.execute("SELECT * FROM scheduled_jobs WHERE id=%s", (jid,))
                 job = cur.fetchone()
         if not job or (job["user_id"] != u["id"] and u["role"] != "admin"):
             bot.answer_callback_query(c.id, "غير مصرّح")
             return
         if action == "run":
             execute_job.apply_async(args=[jid], countdown=0)
-            bot.answer_callback_query(c.id, "▶️ أُرسلت للتنفيذ")
+            bot.answer_callback_query(c.id, "▶️ أُرسلت")
         elif action == "tog":
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    cur.execute("UPDATE scheduled_jobs SET enabled = 1 - enabled WHERE id = %s", (jid,))
+                    cur.execute("UPDATE scheduled_jobs SET enabled = 1 - enabled WHERE id=%s", (jid,))
             bot.answer_callback_query(c.id, "تم التبديل")
         elif action == "del":
             with get_conn() as conn:
                 with conn.cursor() as cur:
-                    cur.execute("DELETE FROM scheduled_jobs WHERE id = %s", (jid,))
+                    cur.execute("DELETE FROM scheduled_jobs WHERE id=%s", (jid,))
             bot.answer_callback_query(c.id, "🗑 حُذفت")
 
-    # ── التقاط القيمة (حالة محادثة عبر DB) ───────────────────────────────────
-    def _has_pending(chat_id) -> bool:
+    # ── معالج النص (آلة الحالة) — محميّ بالكامل ───────────────────────────────
+    def _text_step(chat_id):
         u = _user_by_chat(chat_id)
-        return bool(u) and _get_pending(u["id"]) is not None
+        if not u:
+            return None
+        step, _ = _get_state(u["id"])
+        return step if step in TEXT_STEPS else None
 
     @bot.message_handler(
-        func=lambda m: bool(m.text) and not m.text.startswith("/") and _has_pending(m.chat.id),
+        func=lambda m: bool(m.text) and not m.text.startswith("/") and _text_step(m.chat.id) is not None,
         content_types=["text"],
     )
-    def h_value(m):
+    def h_text(m):
         u = _user_by_chat(m.chat.id)
         if not u:
             return
-        idx = _get_pending(u["id"])
-        _clear_pending(u["id"])
-        if idx is None or idx < 0 or idx >= len(GAMES_DATA):
-            bot.reply_to(m, "انتهت الجلسة. أعد /apps.")
-            return
+        step, data = _get_state(u["id"])
+        text = (m.text or "").strip()
+        try:
+            if step == "device_gaid":
+                data["gaid"] = text
+                _set_state(u["id"], "device_afid", data)
+                bot.reply_to(m, "أرسل AFID:", reply_markup=types.ForceReply(selective=False))
 
-        app_cfg = GAMES_DATA[idx]
-        value = m.text.strip()
+            elif step == "device_idfa":
+                data["idfa"] = text
+                _set_state(u["id"], "device_afid", data)
+                bot.reply_to(m, "أرسل AFID:", reply_markup=types.ForceReply(selective=False))
 
-        # فحص + خصم الرصيد (ذرّي)
-        ok_bal, left = _consume_use(u)
-        if not ok_bal:
-            bot.reply_to(m, "🚫 عذراً، نفد رصيدك. لا يمكن تنفيذ العملية.")
-            return
+            elif step == "device_afid":
+                _save_env(u["id"], os=data.get("os"), gaid=data.get("gaid", ""),
+                          idfa=data.get("idfa", ""), afid=text)
+                _clear_state(u["id"])
+                bot.reply_to(m, "✅ تم حفظ بيانات الجهاز. (راجِعها بـ /profile)")
 
-        bot.send_chat_action(m.chat.id, "typing")
-        ok, info, transport_err = _dispatch_event(app_cfg, value, u)
+            elif step == "proxy":
+                _save_env(u["id"], proxy=text)
+                _clear_state(u["id"])
+                bot.reply_to(m, "✅ تم حفظ البروكسي.")
 
-        if not ok and transport_err:
-            _refund_use(u)          # لم يصل الطلب — نعيد الرصيد
-            left += 1
+            elif step == "app_value":
+                data["value"] = text
+                _set_state(u["id"], "awaiting_when", data)
+                kb = types.InlineKeyboardMarkup()
+                kb.row(
+                    types.InlineKeyboardButton("⚡ تنفيذ فوري", callback_data="when:now"),
+                    types.InlineKeyboardButton("🗓 جدولة مخصّصة", callback_data="when:sched"),
+                )
+                bot.reply_to(m, "متى تريد تنفيذ هذا الاختبار؟", reply_markup=kb)
 
-        if ok:
-            bot.reply_to(
-                m,
-                f"✅ تم الإرسال بنجاح.\n"
-                f"التطبيق: {app_cfg['name']}\nالقيمة: {value}\n"
-                f"الرصيد المتبقي: {left}",
-            )
-        else:
-            bot.reply_to(
-                m,
-                f"❌ فشل الإرسال ({info}).\nالرصيد المتبقي: {left}",
-            )
+            elif step == "schedule_delay":
+                minutes = _parse_delay_minutes(text)
+                if minutes is None:
+                    _clear_state(u["id"])
+                    bot.reply_to(m, "صيغة غير صحيحة. مثال صحيح: 24h أو 3d.\nأعد /apps للبدء.")
+                    return
+                ok, result = _schedule_test(u, data.get("app_index", -1), data.get("value", ""), minutes)
+                _clear_state(u["id"])
+                if not ok and result == "balance":
+                    bot.reply_to(m, "🚫 نفد رصيدك. تعذّرت الجدولة.")
+                elif not ok:
+                    bot.reply_to(m, "تعذّرت الجدولة (انتهت الجلسة أو خطأ). أعد /apps.")
+                else:
+                    when_txt = result.strftime("%Y-%m-%d %H:%M UTC") if hasattr(result, "strftime") else str(result)
+                    bot.reply_to(m, f"🗓 تمت جدولة الاختبار.\nموعد التنفيذ: {when_txt}\nخُصم من رصيدك مقدّماً.")
+            else:
+                _clear_state(u["id"])
+        except Exception as e:
+            # تنظيف الحالة دائماً حتى لا يعلق المستخدم
+            logger.error(f"[Telegram] state '{step}' error: {e}")
+            try:
+                _clear_state(u["id"])
+            except Exception:
+                pass
+            bot.reply_to(m, "حدث خطأ غير متوقّع. أُعيد ضبط الجلسة — أعد المحاولة.")
 
 
 _register_handlers()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# تكامل Flask (Webhook) — يستوردها web.py
+# تكامل Flask (Webhook)
 # ═══════════════════════════════════════════════════════════════════════════════
 def register_webhook(app) -> None:
     if not bot:
@@ -490,11 +740,7 @@ def maybe_setup_webhook() -> None:
     url = f"{base.rstrip('/')}/telegram/webhook/{secret}"
     try:
         bot.remove_webhook()
-        bot.set_webhook(
-            url=url,
-            secret_token=(config.TELEGRAM_WEBHOOK_SECRET or None),
-            drop_pending_updates=False,
-        )
+        bot.set_webhook(url=url, secret_token=(config.TELEGRAM_WEBHOOK_SECRET or None), drop_pending_updates=False)
         logger.info(f"[Telegram] webhook set → {url}")
     except Exception as e:
         logger.warning(f"[Telegram] setWebhook failed: {e}")
