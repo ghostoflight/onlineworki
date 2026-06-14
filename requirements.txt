@@ -1,0 +1,15 @@
+# Web Framework
+flask==3.0.3
+flask-cors==4.0.1
+gunicorn==22.0.0
+
+# Database
+# 2.9.10 يوفّر wheels جاهزة لبايثون 3.11/3.12/3.13 — لا حاجة لأدوات بناء (يمنع فشل Railway)
+psycopg2-binary==2.9.10
+
+# Task Queue
+celery==5.4.0
+redis==5.0.8             # Python Redis client (يستخدمه Celery كـ broker)
+
+# HTTP Requests
+requests==2.32.3
