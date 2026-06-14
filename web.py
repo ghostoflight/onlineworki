@@ -134,6 +134,46 @@ def require_admin(f):
 # AUTH
 # ═══════════════════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# TELEGRAM BOT (بوت مشترك تفاعلي — Webhook)
+# ═══════════════════════════════════════════════════════════════════════════════
+try:
+    from bot.telegram_bot import register_webhook, maybe_setup_webhook
+    register_webhook(app)        # يضيف مسار /telegram/webhook/<secret>
+    maybe_setup_webhook()        # يسجّل العنوان لدى تلغرام (إن توفّر العنوان العام)
+except Exception as _tg_e:
+    logger.warning(f"[Telegram] bot init skipped: {_tg_e}")
+
+
+@app.post("/api/telegram/link-code")
+@require_auth
+def telegram_link_code():
+    """يولّد رمز ربط لمرة واحدة يربط حساب التطبيق بمحادثة تلغرام."""
+    user = request.current_user
+    code = secrets.token_hex(3).upper()   # 6 محارف
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO user_data (user_id, key, value, updated)
+                VALUES (%s, 'tg_link_code', %s, NOW())
+                ON CONFLICT (user_id, key)
+                DO UPDATE SET value = EXCLUDED.value, updated = NOW()
+            """, (user["id"], code))
+    username = config.TELEGRAM_BOT_USERNAME
+    deep_link = f"https://t.me/{username}?start={code}" if username else None
+    return jsonify({"code": code, "deep_link": deep_link})
+
+
+@app.post("/api/telegram/unlink")
+@require_auth
+def telegram_unlink():
+    user = request.current_user
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE users SET tg_chat_id = NULL WHERE id = %s", (user["id"],))
+    return jsonify({"ok": True})
+
+
 @app.get("/")
 def index():
     return jsonify({"status": "online", "version": "3.0"})

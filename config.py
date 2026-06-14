@@ -33,3 +33,14 @@ TASK_RETRY_BACKOFF = int(os.environ.get("TASK_RETRY_BACKOFF", "60"))
 # ─── Flask ───────────────────────────────────────────────────────────────────
 SECRET_KEY = os.environ.get("SECRET_KEY", "change-me-in-production")
 DEBUG      = os.environ.get("FLASK_DEBUG", "0") == "1"
+
+# ─── Telegram Bot (بوت مشترك تفاعلي) ─────────────────────────────────────────
+TELEGRAM_BOT_TOKEN      = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_BOT_USERNAME   = os.environ.get("TELEGRAM_BOT_USERNAME", "")   # بدون @ (لروابط الربط العميقة)
+TELEGRAM_WEBHOOK_SECRET = os.environ.get("TELEGRAM_WEBHOOK_SECRET", "") # سرّ عشوائي يحمي مسار الـ webhook
+
+# العنوان العام: يُؤخذ من PUBLIC_BASE_URL أو يُشتق تلقائياً من Railway
+PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "") or (
+    f"https://{os.environ['RAILWAY_PUBLIC_DOMAIN']}"
+    if os.environ.get("RAILWAY_PUBLIC_DOMAIN") else ""
+)

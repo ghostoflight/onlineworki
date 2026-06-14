@@ -13,3 +13,6 @@ redis==5.0.8             # Python Redis client (يستخدمه Celery كـ broke
 
 # HTTP Requests
 requests==2.32.3
+
+# Telegram Bot
+pyTelegramBotAPI==4.21.0

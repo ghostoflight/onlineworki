@@ -184,12 +184,13 @@ def execute_job(self, job_id: int) -> dict:
     final_status = "success" if all_ok else "partial_error"
     _update_job_status(job_id, final_status, output_log[:2000])
 
-    # ── إرسال إشعار Telegram (إن كان مُفعّلاً) ───────────────────────────
-    if user and user.get("tg_token") and user.get("tg_chat_id"):
+    # ── إرسال إشعار Telegram (البوت المشترك أولاً، ثم توكن المستخدم القديم) ──
+    tg_token = config.TELEGRAM_BOT_TOKEN or (user.get("tg_token") if user else "")
+    if user and tg_token and user.get("tg_chat_id"):
         icon     = "✅" if all_ok else "⚠️"
         short    = output_log.replace("\n", " | ")[:150]
         msg_text = f"{icon} *Job Done*\nTask: `{job['name']}`\nStatus: `{final_status}`\nLogs: `{short}`"
-        _send_telegram(user["tg_token"], user["tg_chat_id"], msg_text)
+        _send_telegram(tg_token, user["tg_chat_id"], msg_text)
 
     logger.info(f"[Worker] Job {job_id} finished → {final_status}")
     return {"job_id": job_id, "status": final_status}
