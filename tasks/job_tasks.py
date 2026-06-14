@@ -44,7 +44,7 @@ def _send_telegram(token: str, chat_id: str, text: str) -> None:
     try:
         requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"},
+            json={"chat_id": chat_id, "text": text},
             timeout=8,
         )
     except Exception as e:
@@ -52,6 +52,38 @@ def _send_telegram(token: str, chat_id: str, text: str) -> None:
 
 
 # ─── المهمة المجدولة: مسح Jobs المستحقة كل دقيقة ────────────────────────────
+def _get_user_env(user_id) -> dict:
+    """يقرأ بيئة المختبِر (tg_env) من user_data: os / gaid / idfa / afid / proxy."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value FROM user_data WHERE user_id = %s AND key = 'tg_env'",
+                    (user_id,),
+                )
+                row = cur.fetchone()
+        return json.loads(row["value"]) if row and row.get("value") else {}
+    except Exception as e:
+        logger.warning(f"[Worker] read tg_env failed: {e}")
+        return {}
+
+
+def _notify_enabled(user_id) -> bool:
+    """مُفعّل افتراضياً ما لم يُضبط notify_enabled صراحةً على '0'."""
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT value FROM user_data WHERE user_id = %s AND key = 'notify_enabled'",
+                    (user_id,),
+                )
+                row = cur.fetchone()
+        return (row["value"] if row else "1") == "1"
+    except Exception as e:
+        logger.warning(f"[Worker] read notify_enabled failed: {e}")
+        return True
+
+
 @celery.task(name="tasks.job_tasks.scan_and_dispatch_due_jobs")
 def scan_and_dispatch_due_jobs() -> dict:
     """
@@ -124,6 +156,15 @@ def execute_job(self, job_id: int) -> dict:
         job.get("proxy_user", ""), job.get("proxy_pass", ""),
     )
 
+    # ── توجيه ديناميكي للبيانات حسب بيئة المختبِر (user_data.tg_env) ──────
+    env = _get_user_env(job["user_id"])
+    os_ = (env.get("os") or "").lower()
+    afid = env.get("afid") or job.get("afid") or ""
+    if os_ == "ios":
+        device_id = env.get("idfa") or job.get("gaid") or ""
+    else:  # android أو غير محدّد → advertising_id
+        device_id = env.get("gaid") or job.get("gaid") or ""
+
     output_log = ""
     all_ok     = True
     progressed = False   # هل أُرسِل/سُجِّل أي حدث؟ (مفتاح تفادي التكرار عند Retry)
@@ -132,16 +173,22 @@ def execute_job(self, job_id: int) -> dict:
     for ev in events:
         ev_name = ev.get("name", "").replace("{}", "1")
         try:
+            body = {
+                "appsflyer_id": afid,
+                "eventName":    ev_name,
+                "eventTime":    datetime.now(timezone.utc).isoformat(),
+                "eventValue":   "{}",
+            }
+            # توجيه المعرّف: iOS → idfa، Android (أو غير محدّد) → advertising_id
+            if os_ == "ios":
+                body["idfa"] = device_id
+            else:
+                body["advertising_id"] = device_id
+
             resp = requests.post(
                 f"https://api2.appsflyer.com/inappevent/{job['package']}",
                 headers={"authentication": job.get("dev_key") or ""},
-                json={
-                    "appsflyer_id":   job.get("afid") or "",
-                    "advertising_id": job.get("gaid") or "",
-                    "eventName":      ev_name,
-                    "eventTime":      datetime.now(timezone.utc).isoformat(),
-                    "eventValue":     "{}",
-                },
+                json=body,
                 proxies=proxies,
                 timeout=15,
             )
@@ -184,13 +231,23 @@ def execute_job(self, job_id: int) -> dict:
     final_status = "success" if all_ok else "partial_error"
     _update_job_status(job_id, final_status, output_log[:2000])
 
-    # ── إرسال إشعار Telegram (البوت المشترك أولاً، ثم توكن المستخدم القديم) ──
-    tg_token = config.TELEGRAM_BOT_TOKEN or (user.get("tg_token") if user else "")
-    if user and tg_token and user.get("tg_chat_id"):
-        icon     = "✅" if all_ok else "⚠️"
-        short    = output_log.replace("\n", " | ")[:150]
-        msg_text = f"{icon} *Job Done*\nTask: `{job['name']}`\nStatus: `{final_status}`\nLogs: `{short}`"
-        _send_telegram(tg_token, user["tg_chat_id"], msg_text)
+    # ── إشعار Telegram — مشروط بـ notify_enabled ومعزول تماماً ───────────
+    # try/except منفصل: أي خطأ في تلغرام يجب ألا يوقف أو يؤثّر على الـ Worker.
+    try:
+        if user and user.get("tg_chat_id") and _notify_enabled(job["user_id"]):
+            token = config.TELEGRAM_BOT_TOKEN or user.get("tg_token") or ""
+            if token:
+                icon  = "✅" if all_ok else "⚠️"
+                short = output_log.replace("\n", " | ")[:150]
+                msg   = (
+                    f"{icon} نتيجة الاختبار\n"
+                    f"المهمة: {job['name']}\n"
+                    f"الحالة: {final_status}\n"
+                    f"السجلّ: {short}"
+                )
+                _send_telegram(token, user["tg_chat_id"], msg)
+    except Exception as e:
+        logger.warning(f"[Telegram] notification skipped (worker continues): {e}")
 
     logger.info(f"[Worker] Job {job_id} finished → {final_status}")
     return {"job_id": job_id, "status": final_status}
