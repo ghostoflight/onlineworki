@@ -374,9 +374,18 @@ def proxy_send_event():
         return jsonify({"success": False, "error": "Missing fields"}), 400
 
     user       = request.current_user
-    package    = data["package"]
-    dev_key    = data["dev_key"]
+    package    = str(data["package"]).strip()
+    dev_key    = str(data["dev_key"]).strip()
     body_data  = data["body"]
+
+    # بوابة الصدّ: لا نرسل طلباً فارغاً/ناقصاً (يمنع الرفض وهدر الرصيد)
+    if not package or not dev_key:
+        return jsonify({"success": False, "error": "package and dev_key must not be empty"}), 400
+    if not isinstance(body_data, dict) or not str(body_data.get("eventName", "")).strip():
+        return jsonify({"success": False, "error": "body must include a non-empty eventName"}), 400
+    if not any(str(body_data.get(k, "")).strip() for k in ("advertising_id", "idfa", "appsflyer_id")):
+        return jsonify({"success": False, "error": "body must include a device identifier (advertising_id/idfa/appsflyer_id)"}), 400
+
     event_name = body_data.get("eventName", "unknown")
 
     from tasks.job_tasks import _build_proxies, _log_event_history  # local import
@@ -476,6 +485,20 @@ def create_job():
     except Exception:
         return jsonify({"error": "Invalid run_at format. Use YYYY-MM-DD HH:MM:SS"}), 400
 
+    # بوابة الصدّ: تحقّق من وجود بيانات فعلية قبل الإدراج (يمنع صفوفاً معطوبة)
+    package = str(data.get("package", "")).strip()
+    dev_key = str(data.get("dev_key", "")).strip()
+    gaid    = str(data.get("gaid", "")).strip()
+    afid    = str(data.get("afid", "")).strip()
+    missing = [k for k, v in (("package", package), ("dev_key", dev_key),
+                              ("gaid", gaid), ("afid", afid)) if not v]
+    if missing:
+        return jsonify({"error": "Missing required fields: " + ", ".join(missing)}), 400
+    if not isinstance(events, list) or not all(
+        isinstance(e, dict) and str(e.get("name", "")).strip() for e in events
+    ):
+        return jsonify({"error": "events must be a non-empty list of objects with a non-empty name"}), 400
+
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -490,8 +513,7 @@ def create_job():
                 json.dumps(events), run_at_norm,
                 data.get("proxy_host", ""), data.get("proxy_port", ""),
                 data.get("proxy_user", ""), data.get("proxy_pass", ""),
-                data.get("package",    ""), data.get("dev_key",    ""),
-                data.get("gaid",       ""), data.get("afid",       ""),
+                package, dev_key, gaid, afid,
             ))
             jid = cur.fetchone()["id"]
     return jsonify({"ok": True, "id": jid})
@@ -620,13 +642,22 @@ def admin_create_user():
     username  = data.get("username", "").strip()
     password  = data.get("password", "").strip()
     role      = data.get("role", "user")
-    max_uses  = int(data.get("max_uses", 100))
     expire_at = data.get("expire_at") or None
 
     if not username or not password:
         return jsonify({"error": "username and password required"}), 400
+    if not re.fullmatch(r"[A-Za-z0-9_.\-]{3,32}", username):
+        return jsonify({"error": "username must be 3-32 chars (letters, digits, . _ -)"}), 400
+    if not (8 <= len(password) <= 128):
+        return jsonify({"error": "password must be 8-128 characters"}), 400
     if role not in ("user", "admin"):
         return jsonify({"error": "Invalid role"}), 400
+    try:
+        max_uses = int(data.get("max_uses", 100))
+    except (TypeError, ValueError):
+        return jsonify({"error": "max_uses must be an integer"}), 400
+    if not (0 <= max_uses <= 1_000_000):
+        return jsonify({"error": "max_uses out of range (0..1000000)"}), 400
 
     try:
         with get_conn() as conn:
