@@ -124,10 +124,10 @@ GAMES_DATA = [
         "cat": "other"
     },
     {
-        "name": "FarmVille 3",
-        "package": "com.zynga.farmville3",
-        "dev_key": "KVJuxDJVXQRPoqUVdyWJtj",
-        "level_events": [{"display": "Player level", "template": "Player_Level{}"}],
+        "name": "FarmVille 2 Country Escape",
+        "package": "com.zynga.FarmVille2CountryEscape",
+        "dev_key": "438VCPmX2ZLYvsDPfGLZXb",
+        "level_events": [{"display": "Level complete", "template": "Level{}Complete"}],
         "cat": "farm"
     },
     {
