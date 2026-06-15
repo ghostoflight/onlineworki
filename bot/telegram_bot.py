@@ -52,7 +52,7 @@ else:
 
 FREE_USES = 5
 # خطوات تتطلّب إدخالاً نصّياً (تُلتقط بمعالج النص)
-TEXT_STEPS = {"device_gaid", "device_idfa", "device_afid", "proxy", "app_value", "schedule_delay",
+TEXT_STEPS = {"device_gaid", "device_idfa", "device_afid", "proxy", "sniper_value", "custom_input",
               "add_name", "add_package", "add_devkey", "add_events"}
 
 
@@ -281,14 +281,15 @@ def _dispatch_event(app_cfg, value, user, env):
         # دفاع: لا نرسل طلباً بلا مفتاح. transport_error=True ⇒ يُعاد الرصيد.
         logger.warning(f"[Telegram] dispatch aborted: missing dev_key for {package}")
         return False, "dev_key مفقود", True
-    event_name = app_cfg.get("event", "af_level_achieved")
+    # إصلاح منطقي: إدخال المستخدم (value) هو eventName الصريح، وإلا الافتراضي من app_cfg
+    event_name = (value or "").strip() or app_cfg.get("event", "af_level_achieved")
     os_ = (env.get("os") or "").lower()
 
     body = {
         "appsflyer_id": env.get("afid", "") or app_cfg.get("afid", ""),
         "eventName": event_name,
         "eventTime": datetime.now(timezone.utc).isoformat(),
-        "eventValue": json.dumps({"value": value}),
+        "eventValue": "{}",
     }
     if os_ == "ios":
         body["idfa"] = env.get("idfa", "")
@@ -352,6 +353,44 @@ def _parse_delay_minutes(text):
     return n * 60 if unit == "h" else n * 1440
 
 
+def _parse_custom(text):
+    """
+    وضع المخصّص: "Event | Hours" → (event, minutes) أو None.
+    الجزء الأيمن يقبل رقم ساعات (24) أو صيغة التأخير (24h / 3d).
+    """
+    if "|" not in (text or ""):
+        return None
+    left, right = text.split("|", 1)
+    event = left.strip()
+    right = right.strip()
+    if not event:
+        return None
+    if re.fullmatch(r"\d+", right):
+        h = int(right)
+        if h <= 0:
+            return None
+        return event, h * 60
+    minutes = _parse_delay_minutes(right)   # يدعم 24h / 3d أيضاً
+    return (event, minutes) if minutes else None
+
+
+def _send_mode_menu(chat_id, app_cfg):
+    """قائمة اختيار وضع التنفيذ (HTML bubble) — 🎯 القناص / ✍️ المخصّص."""
+    text = (
+        f"🧪 <b>{html.escape(app_cfg['name'])}</b>\n\n"
+        "اختر <b>وضع التنفيذ</b>:\n\n"
+        "🎯 <b>القناص</b> — حدث واحد فوري (مثل <code>Level 50</code>)\n"
+        "✍️ <b>المخصّص</b> — جدولة بصيغة <code>Event | Hours</code> (مثل <code>Purchase | 24</code>)"
+    )
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton("🎯 القناص", callback_data="mode:sniper"),
+        types.InlineKeyboardButton("✍️ المخصّص", callback_data="mode:custom"),
+    )
+    kb.row(types.InlineKeyboardButton("❌ إلغاء", callback_data="mode:cancel"))
+    bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
+
+
 def _schedule_test(user, idx, value, minutes):
     """
     يجدول اختباراً. يعيد (status, payload):
@@ -372,12 +411,13 @@ def _schedule_test(user, idx, value, minutes):
     if not ok_bal:
         return "balance", None
 
-    event_name = app_cfg.get("event", "af_level_achieved")
+    # إصلاح منطقي: القيمة الممرّرة (value) هي eventName الصريح، وإلا الافتراضي
+    event_name = (value or "").strip() or app_cfg.get("event", "af_level_achieved")
     dev_key = app_cfg.get("dev_key") or _default_dev_key()
     os_ = (env.get("os") or "").lower()
     device_id = env.get("idfa", "") if os_ == "ios" else env.get("gaid", "")
     p_host, p_port, p_user, p_pass = _proxy_parts(env.get("proxy", ""))
-    name = f"{app_cfg['name']} · {event_name}={value}"
+    name = f"{app_cfg['name']} · {event_name}"
     events = json.dumps([{"name": event_name}])
 
     try:
@@ -886,37 +926,43 @@ def _register_handlers():
         if idx < 0 or idx >= len(GAMES_DATA):
             bot.answer_callback_query(c.id, "تطبيق غير موجود")
             return
-        _set_state(u["id"], "app_value", {"app_index": idx})
+        _set_state(u["id"], "awaiting_mode", {"app_index": idx})
         bot.answer_callback_query(c.id)
-        bot.send_message(
-            c.message.chat.id,
-            f"📲 {GAMES_DATA[idx]['name']}\nأرسل رقم المستوى/قيمة الحدث:",
-            reply_markup=types.ForceReply(selective=False),
-        )
+        _send_mode_menu(c.message.chat.id, GAMES_DATA[idx])
 
-    # ── متى التنفيذ؟ (أزرار) ──────────────────────────────────────────────────
-    @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("when:"))
-    def h_when_cb(c):
+    # ── اختيار الوضع: 🎯 القناص (فوري) / ✍️ المخصّص (جدولة) ───────────────────
+    @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("mode:"))
+    def h_mode_cb(c):
         u = _user_by_chat(c.message.chat.id)
         if not u:
             bot.answer_callback_query(c.id, "أرسل /start أولاً")
             return
+        action = c.data.split(":", 1)[1]
+        if action == "cancel":
+            _clear_state(u["id"])
+            bot.answer_callback_query(c.id, "أُلغي")
+            bot.send_message(c.message.chat.id, "❌ أُلغيت العملية.")
+            return
         step, data = _get_state(u["id"])
-        if step != "awaiting_when":
+        if step != "awaiting_mode":
             bot.answer_callback_query(c.id, "انتهت الجلسة")
             return
-        choice = c.data.split(":", 1)[1]
-        if choice == "now":
-            _clear_state(u["id"])
-            bot.answer_callback_query(c.id, "تنفيذ فوري")
-            _do_execute_now(c.message.chat.id, u, data.get("app_index", -1), data.get("value", ""))
-        elif choice == "sched":
-            _set_state(u["id"], "schedule_delay", data)
+        if action == "sniper":
+            _set_state(u["id"], "sniper_value", data)
             bot.answer_callback_query(c.id)
             bot.send_message(
                 c.message.chat.id,
-                "أدخل مدة التأخير (مثل: 24h أو 3d):",
-                reply_markup=types.ForceReply(selective=False),
+                "🎯 <b>وضع القناص</b>\nأرسل اسم/قيمة الحدث للتنفيذ الفوري:\n\nمثال: <code>Level 50</code>",
+                parse_mode="HTML", reply_markup=types.ForceReply(selective=False),
+            )
+        elif action == "custom":
+            _set_state(u["id"], "custom_input", data)
+            bot.answer_callback_query(c.id)
+            bot.send_message(
+                c.message.chat.id,
+                "✍️ <b>الوضع المخصّص</b>\nأرسل بصيغة <code>Event | Hours</code>:\n\n"
+                "مثال: <code>Purchase | 24</code>",
+                parse_mode="HTML", reply_markup=types.ForceReply(selective=False),
             )
 
     # ── أزرار المهام القديمة ──────────────────────────────────────────────────
@@ -977,7 +1023,7 @@ def _register_handlers():
                 return
 
             # رفض الإدخال الفارغ للخطوات التي تتطلّب قيمة (نُبقي الحالة لإعادة المحاولة)
-            if step in ("device_gaid", "device_idfa", "device_afid", "app_value") and not text:
+            if step in ("device_gaid", "device_idfa", "device_afid", "sniper_value") and not text:
                 bot.reply_to(m, "القيمة فارغة. أرسل قيمة صحيحة:",
                              reply_markup=types.ForceReply(selective=False))
                 return
@@ -1010,27 +1056,34 @@ def _register_handlers():
                 _clear_state(u["id"])
                 bot.reply_to(m, msg)
 
-            elif step == "app_value":
-                data["value"] = text
-                _set_state(u["id"], "awaiting_when", data)
-                kb = types.InlineKeyboardMarkup()
-                kb.row(
-                    types.InlineKeyboardButton("⚡ تنفيذ فوري", callback_data="when:now"),
-                    types.InlineKeyboardButton("🗓 جدولة مخصّصة", callback_data="when:sched"),
-                )
-                bot.reply_to(m, "متى تريد تنفيذ هذا الاختبار؟", reply_markup=kb)
-
-            elif step == "schedule_delay":
-                minutes = _parse_delay_minutes(text)
-                if minutes is None:
-                    _clear_state(u["id"])
-                    bot.reply_to(m, "صيغة غير صحيحة. مثال صحيح: 24h أو 3d.\nأعد /apps للبدء.")
-                    return
-                status, result = _schedule_test(u, data.get("app_index", -1), data.get("value", ""), minutes)
+            elif step == "sniper_value":
+                # 🎯 القناص: تنفيذ فوري لحدث واحد (value يُمرَّر لدالة الإرسال كما هي)
+                idx = data.get("app_index", -1)
                 _clear_state(u["id"])
+                _do_execute_now(m.chat.id, u, idx, text)
+
+            elif step == "custom_input":
+                # ✍️ المخصّص: "Event | Hours" → جدولة عبر الدالة الحالية
+                parsed = _parse_custom(text)
+                if not parsed:
+                    bot.reply_to(
+                        m,
+                        "صيغة غير صحيحة. استخدم <code>Event | Hours</code>\nمثال: <code>Purchase | 24</code>",
+                        parse_mode="HTML", reply_markup=types.ForceReply(selective=False),
+                    )
+                    return  # نُبقي الحالة لإعادة المحاولة
+                event, minutes = parsed
+                idx = data.get("app_index", -1)
+                _clear_state(u["id"])
+                status, result = _schedule_test(u, idx, event, minutes)
                 if status == "ok":
                     when_txt = result.strftime("%Y-%m-%d %H:%M UTC") if hasattr(result, "strftime") else str(result)
-                    bot.reply_to(m, f"🗓 تمت جدولة الاختبار.\nموعد التنفيذ: {when_txt}\nخُصم من رصيدك مقدّماً.")
+                    bot.reply_to(
+                        m,
+                        f"🗓 <b>تمت الجدولة</b>\nالحدث: <code>{html.escape(event)}</code>\n"
+                        f"التنفيذ: <code>{html.escape(when_txt)}</code>\nخُصم من رصيدك مقدّماً.",
+                        parse_mode="HTML",
+                    )
                 elif status == "invalid":
                     bot.reply_to(m, _requirements_message(result))
                 elif status == "balance":
