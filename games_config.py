@@ -220,7 +220,7 @@ GAMES_DATA = [
         "dev_key": "TGm97uKTJF7qFCvREggWtf",
         "level_events": [{"display": "Level completed", "template": "level_complete_{}"}],
         "cat": "other"
-    }
+    },
     {
         "name": "Domino Dreams (iOS)",
         "package": "id6444043291",
