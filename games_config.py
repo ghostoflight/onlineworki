@@ -221,4 +221,151 @@ GAMES_DATA = [
         "level_events": [{"display": "Level completed", "template": "level_complete_{}"}],
         "cat": "other"
     }
+    {
+        "name": "Domino Dreams (iOS)",
+        "package": "id6444043291",
+        "dev_key": "Hn5qYjVAaRNJYDcwF4LaWF",
+        "level_events": [{"display": "Area completed", "template": "af_area_{}_completed"}],
+        "cat": "ios"
+    },
+    {
+        "name": "Disney Solitaire (iOS)",
+        "package": "id6475757306",
+        "dev_key": "Hn5qYjVAaRNJYDcwF4LaWF",
+        "level_events": [{"display": "Area completed", "template": "af_area_{}_completed"}],
+        "cat": "ios"
+    },
+    {
+        "name": "Coin Master (iOS)",
+        "package": "id406889139",
+        "dev_key": "H3KjoCRVTiVgA5mWSAHtCe",
+        "level_events": [{"display": "Village complete", "template": "village_{}_complete"}],
+        "cat": "ios"
+    },
+    {
+        "name": "Board Adventure (iOS)",
+        "package": "id6745761596",
+        "dev_key": "H3KjoCRVTiVgA5mWSAHtCe",
+        "level_events": [{"display": "Village complete", "template": "village_{}_complete"}],
+        "cat": "ios"
+    },
+    {
+        "name": "Dice Dreams (iOS)",
+        "package": "id1484468651",
+        "dev_key": "Hn5qYjVAaRNJYDcwF4LaWF",
+        "level_events": [{"display": "Kingdom restored", "template": "af_kingdom_{}_restored"}],
+        "cat": "ios"
+    },
+    {
+        "name": "Toon Blast (iOS)",
+        "package": "id1176027022",
+        "dev_key": "F9M4SkdtH8WHcAt86ESrF3",
+        "level_events": [{"display": "Level completed", "template": "level_{}_completed"}],
+        "cat": "ios"
+    },
+    {
+        "name": "Match Factory (iOS)",
+        "package": "id6444094229",
+        "dev_key": "F9M4SkdtH8WHcAt86ESrF3",
+        "level_events": [{"display": "Level completed", "template": "level_{}_completed"}],
+        "cat": "ios"
+    },
+    {
+        "name": "Gardenscapes (iOS)",
+        "package": "id1105855019",
+        "dev_key": "ixMH7WQi4SqLAmPWuyAtkH",
+        "level_events": [{"display": "Achieved level", "template": "AchievedLevel{}"}],
+        "cat": "ios"
+    },
+    {
+        "name": "Homescapes (iOS)",
+        "package": "id1195621598",
+        "dev_key": "ixMH7WQi4SqLAmPWuyAtkH",
+        "level_events": [{"display": "Achieved level", "template": "AchievedLevel{}"}],
+        "cat": "ios"
+    },
+    {
+        "name": "Fishdom (iOS)",
+        "package": "id664575829",
+        "dev_key": "ixMH7WQi4SqLAmPWuyAtkH",
+        "level_events": [{"display": "Achieved level", "template": "acheivedlevel{}"}],
+        "cat": "ios"
+    },
+    {
+        "name": "Township (iOS)",
+        "package": "id63868907",
+        "dev_key": "nr8SibwpFjcKGBQNpDdttd",
+        "level_events": [{"display": "Achieved level", "template": "achievedlevel{}"}],
+        "cat": "ios"
+    },
+    {
+        "name": "Travel Town (iOS)",
+        "package": "id1521236603",
+        "dev_key": "wizhvjciCuaDbAaR8KpZLn",
+        "level_events": [{"display": "Reached level", "template": "reachedLevel{}"}],
+        "cat": "ios"
+    },
+    {
+        "name": "Merge Studio (iOS)",
+        "package": "id1615964753",
+        "dev_key": "mFaiXvTWy8votzp3UpsSfS",
+        "level_events": [{"display": "Level completed", "template": "level_completed_{}"}],
+        "cat": "ios"
+    },
+    {
+        "name": "Taylor's Secret (iOS)",
+        "package": "id1659615328",
+        "dev_key": "qbKVyawAiwNX3b4D3Frijm",
+        "level_events": [{"display": "Level achieved", "template": "level_{}"}],
+        "cat": "ios"
+    },
+    {
+        "name": "Yarn Loop! (iOS)",
+        "package": "id6755183085",
+        "dev_key": "TGm97uKTJF7qFCvREggWtf",
+        "level_events": [{"display": "Level complete", "template": "level_complete_{}"}],
+        "cat": "ios"
+    },
+    {
+        "name": "Klondike (iOS)",
+        "package": "id1127240206",
+        "dev_key": "oTiS8cJmQRTDXbixob6wQL",
+        "level_events": [{"display": "Level achieved", "template": "level {}"}],
+        "cat": "ios"
+    },
+    {
+        "name": "screw guru (iOS)",
+        "package": "id6737529244",
+        "dev_key": "nYwfftoacbopmuszWBPGnd",
+        "level_events": [{"display": "Level achieved", "template": "af_level_achieved{}"}],
+        "cat": "ios"
+    },
+    {
+        "name": "Solitaire Smash (iOS)",
+        "package": "id6446482475",
+        "dev_key": "PuaMuZXWm4zYzfDQNwW9Nf",
+        "level_events": [{"display": "Deposit and win", "template": "deposit_0_and_win_{}"}],
+        "cat": "ios"
+    },
+    {
+        "name": "Solitaire Cash (iOS)",
+        "package": "id1446254576",
+        "dev_key": "HwQpkdp5VP6pSvK3Cd486g",
+        "level_events": [{"display": "Reached level", "template": "ReachedLevel{}"}],
+        "cat": "ios"
+    },
+    {
+        "name": "haunted merge (iOS)",
+        "package": "id6752369665",
+        "dev_key": "6mUaoEXrUfgJUnRCue6ZeM",
+        "level_events": [{"display": "HR level", "template": "hr_level_{}"}],
+        "cat": "ios"
+    },
+    {
+        "name": "Merge Gardens (iOS)",
+        "package": "id1464675244",
+        "dev_key": "nr8SibwpFjcKGBQNpDdttd",
+        "level_events": [{"display": "Incent player level up", "template": "Incent_Player_Level_Up_{}"}],
+        "cat": "ios"
+    }
 ]
