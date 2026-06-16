@@ -31,14 +31,16 @@ def _mask_key(dev_key: str) -> str:
     return (dev_key[:4] + "…" + str(len(dev_key)) + "c") if dev_key else "<none>"
 
 
-def _build_proxies(host: str, port: str, user: str, passwd: str) -> dict | None:
+def _build_proxies(host: str, port: str, user: str, passwd: str, scheme: str = "http") -> dict | None:
     if not host:
         return None
+    scheme = (scheme or "http").lower().strip()
     creds = ""
     if user:
         creds = f"{quote(str(user), safe='')}:{quote(str(passwd or ''), safe='')}@"
     p   = port or "80"
-    url = f"http://{creds}{host}:{p}"
+    url = f"{scheme}://{creds}{host}:{p}"
+    # SOCKS5 needs the 'requests[socks]' (PySocks) extra installed.
     return {"http": url, "https": url}
 
 
@@ -174,6 +176,7 @@ def execute_job(self, job_id: int, _sent_events: list | None = None) -> dict:
     proxies = _build_proxies(
         job.get("proxy_host", ""), job.get("proxy_port", ""),
         job.get("proxy_user", ""), job.get("proxy_pass", ""),
+        scheme=(job.get("proxy_scheme") or "http"),
     )
     package = job["package"]
     url     = APPSFLYER_URL.format(package=package)
