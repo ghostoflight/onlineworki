@@ -32,7 +32,7 @@ def get_pool() -> pool.ThreadedConnectionPool:
             if _pool is None or _pool.closed:
                 _pool = pool.ThreadedConnectionPool(
                     minconn=2,
-                    maxconn=20,
+                    maxconn=60,
                     dsn=config.DATABASE_URL,
                     cursor_factory=extras.RealDictCursor,
                 )
