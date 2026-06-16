@@ -1,6 +1,3 @@
-bash
-
-cd /home/claude/project_fixed && mkdir -p . && cat > web.py << 'PYEOF'
 """
 web.py — Flask API Service
 
