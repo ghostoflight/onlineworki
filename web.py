@@ -775,9 +775,16 @@ def handle_exception(e):
 
 if __name__ == "__main__":
     import os
-    init_db()
+    try:
+        init_db()
+    except Exception as e:
+        logger.error(f"[DB] init_db failed at startup: {e}")
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=config.DEBUG)
 else:
-    # عند تشغيل gunicorn، نُهيّئ قاعدة البيانات هنا
-    init_db()
+    # Under gunicorn: initialize the schema here, but never let a transient DB
+    # hiccup crash the worker boot — routes can still serve once the DB recovers.
+    try:
+        init_db()
+    except Exception as e:
+        logger.error(f"[DB] init_db failed under gunicorn: {e}")
