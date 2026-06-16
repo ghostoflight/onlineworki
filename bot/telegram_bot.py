@@ -1499,60 +1499,89 @@ def _register_handlers():
         _send_add_step(m.chat.id, "add_name", {})
 
     @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("add:"))
-    def h_add_cb(c):
-        u = _user_by_chat(c.message.chat.id)
-        if not u:
-            bot.answer_callback_query(c.id, "أرسل /start أولاً")
+def h_add_cb(c):
+    # 1. إيقاف عجلة التحميل فوراً قبل أي اتصال بقاعدة البيانات (السر المفقود للسرعة)
+    try:
+        bot.answer_callback_query(c.id)
+    except:
+        pass
+
+    u = _user_by_chat(c.message.chat.id)
+    if not u:
+        bot.send_message(c.message.chat.id, "أرسل /start أولاً")
+        return
+
+    action = c.data.split(":", 1)[1]
+
+    if action == "cancel":
+        _clear_state(u["id"])
+        # 2. تعديل الرسالة الحالية بدلاً من إرسال رسالة جديدة بالأسفل
+        bot.edit_message_text(
+            chat_id=c.message.chat.id,
+            message_id=c.message.message_id,
+            text="❌ تم إلغاء إنشاء المهمة."
+        )
+        return
+
+    if action == "restart":
+        _set_state(u["id"], "add_name", {})
+        _send_add_step(c.message.chat.id, "add_name", {})
+        return
+
+    if action == "back":
+        step, data = _get_state(u["id"])
+        prev = _ADD_PREV.get(step)
+        if prev:
+            _set_state(u["id"], prev, data)
+            _send_add_step(c.message.chat.id, prev, data)
+        return
+
+    if action == "save":
+        step, data = _get_state(u["id"])
+        if step != "awaiting_confirm":
+            bot.edit_message_text(
+                chat_id=c.message.chat.id,
+                message_id=c.message.message_id,
+                text="انتهت الجلسة."
+            )
             return
-        action = c.data.split(":", 1)[1]
-        if action == "cancel":
+
+        if not all(data.get(k) for k in ("name", "package", "dev_key", "events")):
             _clear_state(u["id"])
-            bot.answer_callback_query(c.id, "أُلغي")
-            bot.send_message(c.message.chat.id, "❌ تم إلغاء إنشاء المهمة.")
+            bot.edit_message_text(
+                chat_id=c.message.chat.id,
+                message_id=c.message.message_id,
+                text="بيانات ناقصة. أعد /add."
+            )
             return
-        if action == "restart":
-            _set_state(u["id"], "add_name", {})
-            bot.answer_callback_query(c.id)
-            _send_add_step(c.message.chat.id, "add_name", {})
-            return
-        if action == "back":
-            step, data = _get_state(u["id"])
-            prev = _ADD_PREV.get(step)
-            bot.answer_callback_query(c.id)
-            if prev:
-                _set_state(u["id"], prev, data)
-                _send_add_step(c.message.chat.id, prev, data)
-            return
-        if action == "save":
-            step, data = _get_state(u["id"])
-            if step != "awaiting_confirm":
-                bot.answer_callback_query(c.id, "انتهت الجلسة")
-                return
-            if not all(data.get(k) for k in ("name", "package", "dev_key", "events")):
-                _clear_state(u["id"])
-                bot.answer_callback_query(c.id)
-                bot.send_message(c.message.chat.id, "بيانات ناقصة. أعد /add.")
-                return
-            jid = _save_add_job(u, data)
-            _clear_state(u["id"])
-            bot.answer_callback_query(c.id, "تم الحفظ")
-            if jid:
-                env = _get_env(u["id"])
-                ready = (env.get("os") and (env.get("gaid") or env.get("idfa")) and env.get("afid"))
-                note = "" if ready else "\n\n⚠️ بيئة جهازك غير مكتملة — أكملها عبر /profile قبل التشغيل."
-                bot.send_message(
-                    c.message.chat.id,
-                    f"✅ <b>تم حفظ المهمة</b> (#{jid}).\nستُنفَّذ خلال دقيقة عند أقرب مسح.{note}",
-                    parse_mode="HTML",
-                )
-            else:
-                bot.send_message(c.message.chat.id, "❌ تعذّر حفظ المهمة. حاول لاحقاً.")
-            return
-        if action.startswith("exv:"):
-            value = action[len("exv:"):]
-            bot.answer_callback_query(c.id)
-            _add_advance(c.message.chat.id, u, value)
-            return
+
+        jid = _save_add_job(u, data)
+        _clear_state(u["id"])
+        
+        if jid:
+            env = _get_env(u["id"])
+            ready = (env.get("os") and (env.get("gaid") or env.get("idfa")) and env.get("afid"))
+            note = "" if ready else "\n\n⚠️ بيئة جهازك غير مكتملة — أكملها عبر /profile قبل التشغيل."
+            
+            # تعديل رسالة التأكيد لتبدو كشاشة نجاح
+            bot.edit_message_text(
+                chat_id=c.message.chat.id,
+                message_id=c.message.message_id,
+                text=f"✅ <b>تم حفظ المهمة</b> (#{jid}).\nستُنفَّذ خلال دقيقة عند أقرب مسح.{note}",
+                parse_mode="HTML"
+            )
+        else:
+            bot.edit_message_text(
+                chat_id=c.message.chat.id,
+                message_id=c.message.message_id,
+                text="❌ تعذّر حفظ المهمة. حاول لاحقاً."
+            )
+        return
+
+    if action.startswith("exv:"):
+        value = action[len("exv:"):]
+        _add_advance(c.message.chat.id, u, value)
+        return
 
     # ── القائمة الرئيسية (ReplyKeyboard) — تربط الأزرار بالأوامر (i18n) ───────
     @bot.message_handler(
