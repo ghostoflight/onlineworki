@@ -19,8 +19,8 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# minconn=2  : two always-warm (web + worker)
-# maxconn=60 : ceiling for concurrent borrowers (gunicorn workers × threads +
+# minconn=1  : one always-warm connection
+# maxconn=12 : ceiling for concurrent borrowers (gunicorn workers × threads +
 #              celery concurrency). Keep ≤ your Supabase pooler limit.
 _pool: pool.ThreadedConnectionPool | None = None
 _pool_lock = threading.Lock()
@@ -33,8 +33,8 @@ def get_pool() -> pool.ThreadedConnectionPool:
         with _pool_lock:
             if _pool is None or _pool.closed:
                 _pool = pool.ThreadedConnectionPool(
-                    minconn=2,
-                    maxconn=60,
+                    minconn=1,
+                    maxconn=12,
                     dsn=config.DATABASE_URL,
                     cursor_factory=extras.RealDictCursor,
                 )
@@ -127,6 +127,7 @@ def init_db() -> None:
             proxy_port  TEXT DEFAULT '',
             proxy_user  TEXT DEFAULT '',
             proxy_pass  TEXT DEFAULT '',
+            proxy_scheme TEXT DEFAULT 'http',
             package     TEXT DEFAULT '',
             dev_key     TEXT DEFAULT '',
             gaid        TEXT DEFAULT '',
@@ -140,8 +141,9 @@ def init_db() -> None:
             created     TIMESTAMPTZ DEFAULT NOW()
         );
 
-        -- backward-compat: add the column on pre-existing tables without data loss
+        -- backward-compat: add columns on pre-existing tables without data loss
         ALTER TABLE scheduled_jobs ADD COLUMN IF NOT EXISTS os TEXT DEFAULT '';
+        ALTER TABLE scheduled_jobs ADD COLUMN IF NOT EXISTS proxy_scheme TEXT DEFAULT 'http';
 
         CREATE TABLE IF NOT EXISTS job_logs (
             id      SERIAL PRIMARY KEY,
