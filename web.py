@@ -781,5 +781,4 @@ if __name__ == "__main__":
 else:
     # عند تشغيل gunicorn، نُهيّئ قاعدة البيانات هنا
     init_db()
-PYEOF
-python3 -m py_compile web.py && echo "web.py COMPILE OK"
+
