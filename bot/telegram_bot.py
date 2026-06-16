@@ -22,6 +22,7 @@ import json
 import hashlib
 import html
 import logging
+import threading
 from functools import wraps
 from datetime import datetime, timezone
 
@@ -458,10 +459,10 @@ def _missing_requirements(app_cfg, env):
     """
     missing = []
     if not (app_cfg.get("dev_key") or _default_dev_key() or "").strip():
-        missing.append("dev_key")            # إعداد مشرف (ليس من المستخدم)
+        missing.append("dev_key")            # admin-side config (not user)
     os_ = (env.get("os") or "").strip().lower()
     if os_ not in ("android", "ios"):
-        missing.append("نظام التشغيل")
+        missing.append("OS")
     elif os_ == "ios" and not (env.get("idfa") or "").strip():
         missing.append("IDFA")
     elif os_ == "android" and not (env.get("gaid") or "").strip():
@@ -471,22 +472,29 @@ def _missing_requirements(app_cfg, env):
     return missing
 
 
-def _requirements_message(missing):
-    """رسالة مناسبة: نقص إعداد المشرف (dev_key) أم نقص إعداد جهاز المستخدم."""
+def _requirements_message(missing, uid=0):
+    """User-facing message: admin dev_key gap vs. user device-config gap."""
     if "dev_key" in missing:
-        return "⚠️ هذا التطبيق غير مُهيّأ للإرسال بعد (مفتاح التطوير مفقود). تواصل مع المشرف."
-    return "⚙️ أكمل إعداد جهازك عبر /profile.\nينقص: " + "، ".join(missing)
+        return _t("app_not_ready", uid)
+    return _t("profile_incomplete", uid) + " " + ", ".join(missing)
 
 
 def _dispatch_event(app_cfg, value, user, env):
-    """يرسل حدث AppsFlyer ببيانات المختبِر. يعيد (ok, info, transport_error)."""
+    """
+    Sends one in-app event for a SPECIFIC package. Returns (ok, info, transport_error).
+
+    Note: the dev_key is package-specific (each app in games_config carries its own
+    dev_key). We resolve it strictly from app_cfg for the requested package — never a
+    global key — then fall back to the admin default only if the app omits one.
+    """
     package = app_cfg["package"]
     dev_key = app_cfg.get("dev_key") or _default_dev_key()
     if not (dev_key or "").strip():
-        # دفاع: لا نرسل طلباً بلا مفتاح. transport_error=True ⇒ يُعاد الرصيد.
-        logger.warning(f"[Telegram] dispatch aborted: missing dev_key for {package}")
-        return False, "dev_key مفقود", True
-    # إصلاح منطقي: إدخال المستخدم (value) هو eventName الصريح، وإلا الافتراضي من app_cfg
+        # Defensive: never POST without a key. transport_error=True ⇒ credit refunded.
+        logger.warning(f"[Dispatch] aborted: missing dev_key for package={package}")
+        return False, "missing dev_key", True
+
+    # User input (value) is the explicit eventName; otherwise the app's default event.
     event_name = (value or "").strip() or app_cfg.get("event", "af_level_achieved")
     os_ = (env.get("os") or "").lower()
 
@@ -505,33 +513,59 @@ def _dispatch_event(app_cfg, value, user, env):
         app_cfg.get("proxy_host", ""), app_cfg.get("proxy_port", ""),
         app_cfg.get("proxy_user", ""), app_cfg.get("proxy_pass", ""),
     )
+
+    url = f"https://api2.appsflyer.com/inappevent/{package}"
+    headers = {"Content-Type": "application/json", "authentication": dev_key or ""}
+
+    # ── Deep debug: exact URL / headers (key masked) / payload, right before POST ──
+    masked = (dev_key[:4] + "…" + str(len(dev_key)) + "c") if dev_key else "<none>"
+    logger.debug(
+        "[Dispatch] POST %s | headers={Content-Type:application/json, authentication:%s} | "
+        "payload=%s | proxied=%s | user=%s",
+        url, masked, json.dumps(body, ensure_ascii=False), bool(proxies), user.get("id"),
+    )
+    if not any(body.get(k) for k in ("advertising_id", "idfa")):
+        logger.error("[Dispatch] payload has NO device identifier (gaid/idfa empty) for package=%s "
+                     "— event will likely be rejected. env=%s", package, {k: env.get(k) for k in ("os", "gaid", "idfa", "afid")})
+
     try:
-        r = requests.post(
-            f"https://api2.appsflyer.com/inappevent/{package}",
-            headers={"Content-Type": "application/json", "authentication": dev_key or ""},
-            json=body, proxies=proxies, timeout=15,
-        )
+        r = requests.post(url, headers=headers, json=body, proxies=proxies, timeout=15)
         ok = r.status_code in (200, 201)
+        if not ok:
+            logger.error("[Dispatch] package=%s status=%s resp=%s", package, r.status_code, (r.text or "")[:200])
         _log_event_history(user["id"], package, event_name, r.status_code, ok)
         return ok, f"HTTP {r.status_code}", False
     except requests.RequestException as e:
+        logger.error("[Dispatch] transport error package=%s: %s", package, e)
         _log_event_history(user["id"], package, event_name, 0, False)
         return False, str(e)[:80], True
 
 
+def _safe_bg(target, args, kwargs):
+    try:
+        target(*args, **kwargs)
+    except Exception as e:
+        logger.error("[BG] background task failed: %s", e)
+
+
+def _bg(target, *args, **kwargs):
+    """Run a blocking task off the webhook thread so Telegram gets its 200 OK instantly."""
+    threading.Thread(target=_safe_bg, args=(target, args, kwargs), daemon=True).start()
+
+
 def _do_execute_now(chat_id, user, idx, value, env=None):
     if idx < 0 or idx >= len(GAMES_DATA):
-        bot.send_message(chat_id, "انتهت الجلسة. أعد /apps.")
+        bot.send_message(chat_id, _t("session_apps", user["id"]))
         return
     app_cfg = GAMES_DATA[idx]
-    if env is None:                       # عزل البيانات: env قد يأتي من المهمة مباشرة
+    if env is None:                       # data isolation: env may come from the task itself
         env = _get_env(user["id"])
-    # بوابة الصدّ: تحقّق قبل خصم الرصيد
+    # validation gate (fast) — before consuming any credit
     missing = _missing_requirements(app_cfg, env)
     if missing:
-        bot.send_message(chat_id, _requirements_message(missing))
+        bot.send_message(chat_id, _requirements_message(missing, user["id"]))
         return
-    # بوابة الرصيد/الاشتراك: الاشتراك الفعّال يتجاوز خصم الرصيد
+    # credit/subscription gate (fast DB) — active subscription bypasses consumption
     consumed = False
     if _has_active_subscription(user["id"]):
         left = user["uses_left"]
@@ -542,14 +576,24 @@ def _do_execute_now(chat_id, user, idx, value, env=None):
             return
         consumed = True
     bot.send_chat_action(chat_id, "typing")
-    ok, info, transport_err = _dispatch_event(app_cfg, value, user, env)
-    if not ok and transport_err and consumed:
-        _refund_use(user)
-        left += 1
-    if ok:
-        bot.send_message(chat_id, f"✅ تم تنفيذ الاختبار.\n{app_cfg['name']} · القيمة: {value}\nالرصيد: {left}")
-    else:
-        bot.send_message(chat_id, f"❌ فشل التنفيذ ({info}).\nالرصيد: {left}")
+
+    uid = user["id"]
+    ev_label = html.escape(str(value or app_cfg.get("event", "")))
+
+    # The actual HTTP send is the only slow part — run it off-thread so the
+    # webhook returns immediately; the result message is sent from the thread.
+    def _worker():
+        ok, info, transport_err = _dispatch_event(app_cfg, value, user, env)
+        bal = left
+        if not ok and transport_err and consumed:
+            _refund_use(user)
+            bal += 1
+        if ok:
+            bot.send_message(chat_id, _t("exec_ok", uid, event=ev_label, left=bal), parse_mode="HTML")
+        else:
+            bot.send_message(chat_id, _t("exec_fail", uid, info=html.escape(str(info)), left=bal), parse_mode="HTML")
+
+    _bg(_worker)
 
 
 _DELAY_RE = re.compile(r"^\s*(\d+)\s*([hHdD])\s*$")
@@ -586,24 +630,17 @@ def _parse_custom(text):
     return (event, minutes) if minutes else None
 
 
-def _send_mode_menu(chat_id, app_cfg, uid=None):
-    """قائمة اختيار وضع التنفيذ (HTML bubble) — 🎯 القناص / ✍️ المخصّص + رجوع."""
-    text = (
-        f"🧪 <b>{html.escape(app_cfg['name'])}</b>\n\n"
-        "اختر <b>وضع التنفيذ</b>:\n\n"
-        "🎯 <b>القناص</b> — حدث واحد فوري (مثل <code>Level 50</code>)\n"
-        "✍️ <b>المخصّص</b> — جدولة بصيغة <code>Event | Hours</code> (مثل <code>Purchase | 24</code>)"
-    )
-    back = _t("btn_back", uid) if uid else "🔙 رجوع"
-    cancel = _t("btn_cancel", uid) if uid else "❌ إلغاء"
+def _send_mode_menu(chat_id, app_cfg, uid=0):
+    """Execution-mode picker (HTML) — Sniper / Custom + back/cancel, fully localized."""
+    text = _t("mode_menu_text", uid, app=html.escape(app_cfg["name"]))
     kb = types.InlineKeyboardMarkup()
     kb.row(
-        types.InlineKeyboardButton("🎯 القناص", callback_data="mode:sniper"),
-        types.InlineKeyboardButton("✍️ المخصّص", callback_data="mode:custom"),
+        types.InlineKeyboardButton(_t("btn_mode_sniper", uid), callback_data="mode:sniper"),
+        types.InlineKeyboardButton(_t("btn_mode_custom", uid), callback_data="mode:custom"),
     )
     kb.row(
-        types.InlineKeyboardButton(back, callback_data="nav:back"),
-        types.InlineKeyboardButton(cancel, callback_data="nav:cancel"),
+        types.InlineKeyboardButton(_t("btn_back", uid), callback_data="nav:back"),
+        types.InlineKeyboardButton(_t("btn_cancel", uid), callback_data="nav:cancel"),
     )
     bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
 
@@ -774,7 +811,7 @@ def linked(handler):
     def wrap(message):
         user = _user_by_chat(message.chat.id)
         if not user:
-            bot.reply_to(message, "أرسل /start أولاً لإنشاء حسابك.")
+            bot.reply_to(message, locales.lookup("need_start"))
             return
         return handler(message, user)
     return wrap
@@ -802,48 +839,37 @@ def _step_bar(step_no, total=5):
     return "▰" * step_no + "▱" * (total - step_no)
 
 
-def _send_add_step(chat_id, step, data, err=None):
-    """يرسل رسالة الخطوة (HTML) مع الكيبورد. err اختياري للتحقّق الفاشل."""
+def _send_add_step(chat_id, step, data, err=None, uid=0):
+    """Sends the step bubble (HTML) + keyboard. err optional for failed validation."""
     kb = types.InlineKeyboardMarkup()
     prefix = f"⚠️ {html.escape(err)}\n\n" if err else ""
+    cancel_btn = types.InlineKeyboardButton(_t("btn_cancel", uid), callback_data="add:cancel")
+    back_btn = types.InlineKeyboardButton(_t("btn_back", uid), callback_data="add:back")
     if step == "add_name":
-        text = (prefix + "➕ <b>إنشاء مهمة جديدة</b>\n\n"
-                f"<code>{_step_bar(1)}</code>  <b>الخطوة 1 من 5</b>\n"
-                "أرسل <b>اسم المهمة</b> (إنجليزي بدون مسافات):\n\n"
-                "مثال: <code>game_launch_v2</code>")
-        kb.row(types.InlineKeyboardButton("❌ إلغاء", callback_data="add:cancel"))
+        text = prefix + _t("add_s1", uid, bar=_step_bar(1))
+        kb.row(cancel_btn)
     elif step == "add_package":
-        text = (prefix + "✅ <b>تم حفظ الاسم</b>\n\n"
-                f"<code>{_step_bar(2)}</code>  <b>الخطوة 2 من 5</b>\n"
-                "أرسل <b>اسم الحزمة</b> (Package Name):\n\n"
-                "مثال: <code>com.example.app</code>")
+        text = prefix + _t("add_s2", uid, bar=_step_bar(2))
         for ex in _ADD_EX["add_package"]:
             kb.row(types.InlineKeyboardButton(ex, callback_data=f"add:exv:{ex}"))
-        kb.row(types.InlineKeyboardButton("🔙 السابق", callback_data="add:back"),
-               types.InlineKeyboardButton("❌ إلغاء", callback_data="add:cancel"))
+        kb.row(back_btn, cancel_btn)
     elif step == "add_devkey":
-        text = (prefix + "✅ تم حفظ الحزمة\n\n"
-                f"<code>{_step_bar(3)}</code>  <b>الخطوة 3 من 5</b>\n"
-                "أرسل <b>Dev Key</b> الخاص بتطبيقك من لوحة AppsFlyer:")
-        kb.row(types.InlineKeyboardButton("🔙 السابق", callback_data="add:back"),
-               types.InlineKeyboardButton("❌ إلغاء", callback_data="add:cancel"))
+        text = prefix + _t("add_s3", uid, bar=_step_bar(3))
+        kb.row(back_btn, cancel_btn)
     elif step == "add_events":
-        text = (prefix + "✅ تم حفظ المفتاح\n\n"
-                f"<code>{_step_bar(4)}</code>  <b>الخطوة 4 من 5</b>\n"
-                "أرسل <b>أسماء الأحداث</b> مفصولة بفاصلة:\n\n"
-                "مثال: <code>af_launch,af_login,af_purchase</code>")
+        text = prefix + _t("add_s4", uid, bar=_step_bar(4))
         for ex in _ADD_EX["add_events"]:
             kb.row(types.InlineKeyboardButton(ex, callback_data=f"add:exv:{ex}"))
-        kb.row(types.InlineKeyboardButton("🔙 السابق", callback_data="add:back"),
-               types.InlineKeyboardButton("❌ إلغاء", callback_data="add:cancel"))
+        kb.row(back_btn, cancel_btn)
     else:
         return
     bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
 
 
 def _send_review(chat_id, user, data):
-    """الخطوة 5: مراجعة المهمة مع معاينة Payload (يشبه صندوق التصميم)."""
-    env = _get_env(user["id"])
+    """Step 5: review the task with a payload preview, fully localized."""
+    uid = user["id"]
+    env = _get_env(uid)
     os_ = (env.get("os") or "").lower()
     afid = env.get("afid", "") or "—"
     dev_id = (env.get("idfa", "") if os_ == "ios" else env.get("gaid", "")) or "—"
@@ -853,7 +879,7 @@ def _send_review(chat_id, user, data):
     name     = html.escape(data.get("name", ""))
     package  = html.escape(data.get("package", ""))
     dev_mask = html.escape(data.get("dev_key", "")[:6] + "…") if data.get("dev_key") else "—"
-    events_s = html.escape("، ".join(data.get("events", [])))
+    events_s = html.escape(", ".join(data.get("events", [])))
 
     payload_raw = (
         "{\n"
@@ -864,56 +890,48 @@ def _send_review(chat_id, user, data):
         f'  "{id_field}": "{dev_id}"\n'
         "}"
     )
-    text = (
-        f"<code>{_step_bar(5)}</code>  <b>الخطوة 5 من 5</b>\n"
-        "✅ <b>مراجعة المهمة قبل الحفظ</b>\n\n"
-        f"📌 الاسم: <b>{name}</b>\n"
-        f"📦 الحزمة: <b>{package}</b>\n"
-        f"🔑 Dev Key: <b>{dev_mask}</b>\n"
-        f"📡 الأحداث: <b>{events_s}</b>\n\n"
-        "<b>Payload (معاينة):</b>\n"
-        f"<code>{html.escape(payload_raw)}</code>\n\n"
-        "هل تريد حفظ المهمة؟"
-    )
+    text = _t("add_review", uid, bar=_step_bar(5), name=name, package=package,
+              devkey=dev_mask, events=events_s, payload=html.escape(payload_raw))
     kb = types.InlineKeyboardMarkup()
-    kb.row(types.InlineKeyboardButton("✅ حفظ المهمة", callback_data="add:save"),
-           types.InlineKeyboardButton("🔄 إعادة البدء", callback_data="add:restart"))
-    kb.row(types.InlineKeyboardButton("❌ إلغاء", callback_data="add:cancel"))
+    kb.row(types.InlineKeyboardButton(_t("btn_save_task", uid), callback_data="add:save"),
+           types.InlineKeyboardButton(_t("btn_restart", uid), callback_data="add:restart"))
+    kb.row(types.InlineKeyboardButton(_t("btn_cancel", uid), callback_data="add:cancel"))
     bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
 
 
 def _add_advance(chat_id, user, value):
-    """يعالج إدخال الخطوة الحالية في /add (من نص أو زر مثال) مع التحقّق."""
-    step, data = _get_state(user["id"])
+    """Handles the current /add step input (text or example button) with validation."""
+    uid = user["id"]
+    step, data = _get_state(uid)
     value = (value or "").strip()
     if step == "add_name":
         if not re.fullmatch(r"[A-Za-z0-9_]{2,40}", value):
-            _send_add_step(chat_id, "add_name", data, err="الاسم إنجليزي بدون مسافات (2–40: حروف/أرقام/_).")
+            _send_add_step(chat_id, "add_name", data, err=_t("add_err_name", uid), uid=uid)
             return
         data["name"] = value
-        _set_state(user["id"], "add_package", data)
-        _send_add_step(chat_id, "add_package", data)
+        _set_state(uid, "add_package", data)
+        _send_add_step(chat_id, "add_package", data, uid=uid)
     elif step == "add_package":
         if "." not in value or not re.fullmatch(r"[A-Za-z0-9_.]{3,80}", value):
-            _send_add_step(chat_id, "add_package", data, err="حزمة غير صالحة. مثال: com.example.app")
+            _send_add_step(chat_id, "add_package", data, err=_t("add_err_package", uid), uid=uid)
             return
         data["package"] = value
-        _set_state(user["id"], "add_devkey", data)
-        _send_add_step(chat_id, "add_devkey", data)
+        _set_state(uid, "add_devkey", data)
+        _send_add_step(chat_id, "add_devkey", data, uid=uid)
     elif step == "add_devkey":
         if len(value) < 6:
-            _send_add_step(chat_id, "add_devkey", data, err="Dev Key قصير جداً.")
+            _send_add_step(chat_id, "add_devkey", data, err=_t("add_err_devkey", uid), uid=uid)
             return
         data["dev_key"] = value
-        _set_state(user["id"], "add_events", data)
-        _send_add_step(chat_id, "add_events", data)
+        _set_state(uid, "add_events", data)
+        _send_add_step(chat_id, "add_events", data, uid=uid)
     elif step == "add_events":
         evs = [e.strip() for e in value.split(",") if e.strip()]
         if not evs:
-            _send_add_step(chat_id, "add_events", data, err="أرسل اسم حدث واحداً على الأقل.")
+            _send_add_step(chat_id, "add_events", data, err=_t("add_err_events", uid), uid=uid)
             return
         data["events"] = evs
-        _set_state(user["id"], "awaiting_confirm", data)
+        _set_state(uid, "awaiting_confirm", data)
         _send_review(chat_id, user, data)
 
 
@@ -947,7 +965,7 @@ def _settings_kb(uid):
     on = _get_notify(uid)
     kb = types.InlineKeyboardMarkup()
     kb.row(types.InlineKeyboardButton(
-        f"إشعارات النتائج: {'مفعّلة ✅' if on else 'موقوفة ⛔'}",
+        _t("settings_notify_on" if on else "settings_notify_off", uid),
         callback_data="settings:toggle",
     ))
     return kb
@@ -955,30 +973,31 @@ def _settings_kb(uid):
 
 def _open_apps(chat_id, user):
     if not GAMES_DATA:
-        bot.send_message(chat_id, "لا توجد تطبيقات مُعرّفة بعد.")
+        bot.send_message(chat_id, _t("no_apps_defined", user["id"]))
         return
-    _set_state(user["id"], "apps_os", {})   # مدخل التدفّق المتسلسل (بلا تاريخ)
+    _set_state(user["id"], "apps_os", {})   # entry of the cascading flow (no history)
     _render_os_ui(chat_id, user)
 
 
 def _open_profile(chat_id, user):
-    env = _get_env(user["id"])
-    os_ = env.get("os", "—")
+    uid = user["id"]
+    env = _get_env(uid)
+    os_ = env.get("os", "") or "—"
     dev_id = env.get("idfa", "") if os_ == "ios" else env.get("gaid", "")
     dev_lbl = "IDFA" if os_ == "ios" else "GAID"
-    txt = (
-        f"🧪 بيئة اختبار {user['username']}\n\n"
-        f"النظام: {os_ or '—'}\n"
-        f"{dev_lbl}: {dev_id or '—'}\n"
-        f"AFID: {env.get('afid','') or '—'}\n"
-        f"البروكسي: {env.get('proxy','') or '—'}"
-    )
+    txt = _t("profile_box", uid,
+             user=html.escape(str(user.get("username", ""))),
+             os=html.escape(str(os_)),
+             devlbl=dev_lbl,
+             devid=html.escape(str(dev_id or "—")),
+             afid=html.escape(str(env.get("afid", "") or "—")),
+             proxy=html.escape(str(env.get("proxy", "") or "—")))
     kb = types.InlineKeyboardMarkup()
     kb.row(
-        types.InlineKeyboardButton("📱 تحديث الجهاز", callback_data="profile:device"),
-        types.InlineKeyboardButton("🌐 تحديث البروكسي", callback_data="profile:proxy"),
+        types.InlineKeyboardButton(_t("btn_upd_device", uid), callback_data="profile:device"),
+        types.InlineKeyboardButton(_t("btn_upd_proxy", uid), callback_data="profile:proxy"),
     )
-    bot.send_message(chat_id, txt, reply_markup=kb)
+    bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=kb)
 
 
 _MENU_KEYS = [
@@ -988,6 +1007,7 @@ _MENU_KEYS = [
     ("btn_settings", "settings"),
     ("btn_balance",  "balance"),
     ("btn_services", "services"),
+    ("btn_lang",     "language"),
 ]
 
 
@@ -996,7 +1016,17 @@ def _main_menu_kb(uid):
     kb.row(_t("btn_new_task", uid), _t("btn_apps", uid))
     kb.row(_t("btn_profile", uid), _t("btn_settings", uid))
     kb.row(_t("btn_balance", uid), _t("btn_services", uid))
+    kb.row(_t("btn_lang", uid))
     return kb
+
+
+def _send_lang_menu(chat_id, uid):
+    """Language picker — native names, one button per supported language."""
+    kb = types.InlineKeyboardMarkup()
+    row = [types.InlineKeyboardButton(locales.name(code), callback_data=f"lang:set:{code}")
+           for code in locales.SUPPORTED]
+    kb.row(*row)
+    bot.send_message(chat_id, _t("lang_choose", uid), reply_markup=kb)
 
 
 def _menu_target(text):
@@ -1039,14 +1069,13 @@ def _send_sub_status(chat_id, u):
 
 
 def _notify_admins_payment(payment_id, user, plan_key, screenshot):
-    """يرسل لقطة الدفع لكل مشرف مع أزرار قبول/رفض (مراجعة يدوية)."""
-    caption = (f"💳 طلب دفع #{payment_id}\n"
-               f"مستخدم: {user['username']} (#{user['id']})\n"
-               f"الباقة: {_plan_label(plan_key)}")
+    """Sends the payment screenshot to each admin with approve/reject buttons."""
+    caption = _t("admin_pay_request", 0, id=payment_id,
+                 user=f"{user['username']} (#{user['id']})", plan=_plan_label(plan_key))
     kb = types.InlineKeyboardMarkup()
     kb.row(
-        types.InlineKeyboardButton("✅ قبول", callback_data=f"pay:approve:{payment_id}"),
-        types.InlineKeyboardButton("❌ رفض",  callback_data=f"pay:reject:{payment_id}"),
+        types.InlineKeyboardButton(_t("btn_approve", 0), callback_data=f"pay:approve:{payment_id}"),
+        types.InlineKeyboardButton(_t("btn_reject", 0),  callback_data=f"pay:reject:{payment_id}"),
     )
     for cid in _admin_chat_ids():
         try:
@@ -1088,17 +1117,16 @@ def _open_jobs(chat_id, u):
 
 
 def _send_job_detail(chat_id, u, job):
-    import json as _json
     try:
         evs = ", ".join(e.get("name", "") for e in (job.get("events") or []))
     except Exception:
         evs = str(job.get("events"))
-    txt = (
-        f"📝 <b>{html.escape(job['name'])}</b>\n"
-        f"📦 <code>{html.escape(job.get('package',''))}</code>\n"
-        f"📡 {html.escape(evs)}\n"
-        f"الحالة: {'✅ مفعّلة' if job['enabled'] else '⏸️ موقوفة'}"
-    )
+    status = _t("job_on" if job["enabled"] else "job_off", u["id"])
+    txt = _t("job_detail", u["id"],
+             name=html.escape(job["name"]),
+             package=html.escape(job.get("package", "")),
+             events=html.escape(evs),
+             status=status)
     kb = types.InlineKeyboardMarkup()
     kb.row(
         types.InlineKeyboardButton(_t("btn_run", u["id"]),    callback_data=f"run:{job['id']}"),
@@ -1167,7 +1195,7 @@ def _register_handlers():
                 _set_chat(uid, m.chat.id)
                 u = _user_by_chat(m.chat.id)
                 _clear_state(u["id"])
-                bot.reply_to(m, f"✅ تم ربط حسابك {u['username']}.\n/apps للبدء.")
+                bot.reply_to(m, _t("linked_ok", u["id"], name=html.escape(u["username"])))
                 return
         if u:
             _clear_state(u["id"])   # إعادة ضبط: مسح كل الحالات المؤقتة
@@ -1189,22 +1217,17 @@ def _register_handlers():
     @bot.message_handler(commands=["lang"])
     @linked
     def h_lang(m, u):
-        kb = types.InlineKeyboardMarkup()
-        kb.row(
-            types.InlineKeyboardButton("العربية", callback_data="lang:set:ar"),
-            types.InlineKeyboardButton("English", callback_data="lang:set:en"),
-        )
-        bot.send_message(m.chat.id, _t("lang_choose", u["id"]), reply_markup=kb)
+        _send_lang_menu(m.chat.id, u["id"])
 
     @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("lang:set:"))
     def h_lang_cb(c):
+        bot.answer_callback_query(c.id)                       # dismiss spinner first
         u = _user_by_chat(c.message.chat.id)
         if not u:
-            bot.answer_callback_query(c.id)
             return
         code = c.data.rsplit(":", 1)[1]
-        _set_lang(u["id"], code)
-        bot.answer_callback_query(c.id)
+        if code in locales.SUPPORTED:
+            _set_lang(u["id"], code)
         bot.send_message(c.message.chat.id, _t("lang_set", u["id"]), reply_markup=_main_menu_kb(u["id"]))
 
     # ── /services — مركز الخدمات (المطلب 7) ──────────────────────────────────
@@ -1215,12 +1238,11 @@ def _register_handlers():
 
     @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("svc:"))
     def h_svc_cb(c):
+        bot.answer_callback_query(c.id)                       # dismiss spinner first
         u = _user_by_chat(c.message.chat.id)
         if not u:
-            bot.answer_callback_query(c.id)
             return
         action = c.data.split(":", 1)[1]
-        bot.answer_callback_query(c.id)
         if action == "plans":
             _send_plans(c.message.chat.id, u)
         elif action == "status":
@@ -1261,9 +1283,9 @@ def _register_handlers():
         if action in ("approve", "reject") and len(parts) > 2 and u["role"] == "admin":
             pid = int(parts[2]) if parts[2].isdigit() else 0
             row = _set_payment_status(pid, "approved" if action == "approve" else "rejected")
-            bot.answer_callback_query(c.id, "تم")
+            bot.answer_callback_query(c.id, _t("pay_done", u["id"]))
             if not row:
-                bot.send_message(c.message.chat.id, "الطلب غير موجود أو روجِع مسبقاً.")
+                bot.send_message(c.message.chat.id, _t("pay_not_found", u["id"]))
                 return
             target = _user_by_id(row["user_id"])
             if action == "approve":
@@ -1274,11 +1296,11 @@ def _register_handlers():
                     bot.send_message(int(target["tg_chat_id"]),
                                      _t("pay_approved", target["id"], plan=_plan_label(row["plan"], target["id"]),
                                         until=until, credits=p.get("credits", 0)), parse_mode="HTML")
-                bot.send_message(c.message.chat.id, f"✅ فُعّل اشتراك المستخدم #{row['user_id']} حتى {until}.")
+                bot.send_message(c.message.chat.id, _t("pay_approved_admin", u["id"], uid=row["user_id"], until=until))
             else:
                 if target and target.get("tg_chat_id"):
                     bot.send_message(int(target["tg_chat_id"]), _t("pay_rejected", target["id"]))
-                bot.send_message(c.message.chat.id, f"❌ رُفض طلب #{pid}.")
+                bot.send_message(c.message.chat.id, _t("pay_rejected_admin", u["id"], id=pid))
             return
         bot.answer_callback_query(c.id)
 
@@ -1299,27 +1321,27 @@ def _register_handlers():
             _notify_admins_payment(pid, u, plan_key, file_id)
             bot.reply_to(m, _t("pay_received", u["id"]))
         else:
-            bot.reply_to(m, "تعذّر تسجيل الطلب. حاول لاحقاً.")
+            bot.reply_to(m, _t("pay_record_fail", u["id"]))
 
     # ── /payments — مراجعة المشرف ────────────────────────────────────────────
     @bot.message_handler(commands=["payments"])
     @linked
     def h_payments(m, u):
         if u["role"] != "admin":
-            bot.reply_to(m, "هذا الأمر للمشرفين فقط.")
+            bot.reply_to(m, _t("admins_only", u["id"]))
             return
         pend = _list_pending_payments()
         if not pend:
-            bot.reply_to(m, "لا توجد طلبات معلّقة.")
+            bot.reply_to(m, _t("no_pending_pay", u["id"]))
             return
         for pay in pend:
             target = _user_by_id(pay["user_id"])
-            cap = (f"💳 طلب #{pay['id']}\nمستخدم: {target['username'] if target else pay['user_id']}\n"
-                   f"الباقة: {_plan_label(pay['plan'])}")
+            cap = _t("admin_pay_request", u["id"], id=pay["id"],
+                     user=(target["username"] if target else pay["user_id"]), plan=_plan_label(pay["plan"]))
             kb = types.InlineKeyboardMarkup()
             kb.row(
-                types.InlineKeyboardButton("✅ قبول", callback_data=f"pay:approve:{pay['id']}"),
-                types.InlineKeyboardButton("❌ رفض",  callback_data=f"pay:reject:{pay['id']}"),
+                types.InlineKeyboardButton(_t("btn_approve", u["id"]), callback_data=f"pay:approve:{pay['id']}"),
+                types.InlineKeyboardButton(_t("btn_reject", u["id"]),  callback_data=f"pay:reject:{pay['id']}"),
             )
             try:
                 bot.send_photo(m.chat.id, pay["screenshot"], caption=cap, reply_markup=kb)
@@ -1334,17 +1356,16 @@ def _register_handlers():
 
     @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("job:"))
     def h_job_view_cb(c):
+        bot.answer_callback_query(c.id)                       # dismiss spinner first
         u = _user_by_chat(c.message.chat.id)
         if not u:
-            bot.answer_callback_query(c.id)
             return
         parts = c.data.split(":")
         action = parts[1] if len(parts) > 1 else ""
         jid = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
         job = _job_owned(jid, u)
-        bot.answer_callback_query(c.id)
         if not job:
-            bot.send_message(c.message.chat.id, "غير مصرّح أو المهمة غير موجودة.")
+            bot.send_message(c.message.chat.id, _t("job_not_found", u["id"]))
             return
         if action == "view":
             _send_job_detail(c.message.chat.id, u, job)
@@ -1353,17 +1374,15 @@ def _register_handlers():
 
     @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("edit:"))
     def h_edit_cb(c):
+        bot.answer_callback_query(c.id)                       # dismiss spinner first
         u = _user_by_chat(c.message.chat.id)
         if not u:
-            bot.answer_callback_query(c.id)
             return
         parts = c.data.split(":")
         if len(parts) < 3:
-            bot.answer_callback_query(c.id)
             return
         field, jid = parts[1], (int(parts[2]) if parts[2].isdigit() else 0)
         job = _job_owned(jid, u)
-        bot.answer_callback_query(c.id)
         if not job or field not in _EDIT_FIELDS:
             return
         # القيمة الحالية (معبّأة مسبقاً)
@@ -1380,27 +1399,25 @@ def _register_handlers():
 
     @bot.message_handler(commands=["help"])
     def h_help(m):
-        bot.reply_to(
-            m,
-            "الأوامر:\n/add — إنشاء مهمة مجدولة (خطوات)\n/apps — بدء اختبار سريع\n"
-            "/profile — بيئة الاختبار (جهاز/بروكسي)\n/settings — الإشعارات\n"
-            "/balance — الرصيد\n/history — السجلّ\n/status — حالتك\n/unlink — فكّ الربط",
-        )
+        u = _user_by_chat(m.chat.id)
+        bot.reply_to(m, _t("help_text", u["id"] if u else 0))
 
     @bot.message_handler(commands=["unlink"])
     def h_unlink(m):
+        u = _user_by_chat(m.chat.id)
+        _uid = u["id"] if u else 0
         _clear_chat(m.chat.id)
-        bot.reply_to(m, "تم فكّ الربط. أرسل /start للبدء مجدداً.")
+        bot.reply_to(m, _t("unlink_ok", _uid))
 
     @bot.message_handler(commands=["balance"])
     @linked
     def h_balance(m, u):
-        bot.reply_to(m, f"💳 رصيدك: {u['uses_left']} من {u['max_uses']}")
+        bot.reply_to(m, _t("balance_line", u["id"], left=u["uses_left"], max=u["max_uses"]))
 
     @bot.message_handler(commands=["status"])
     @linked
     def h_status(m, u):
-        bot.reply_to(m, f"👤 {u['username']}\nالدور: {u['role']}\nالرصيد: {u['uses_left']}/{u['max_uses']}")
+        bot.reply_to(m, _t("status_line", u["id"], username=html.escape(u["username"]), role=u["role"], left=u["uses_left"], max=u["max_uses"]))
 
     @bot.message_handler(commands=["history"])
     @linked
@@ -1412,14 +1429,14 @@ def _register_handlers():
                        WHERE user_id=%s ORDER BY id DESC LIMIT 8""", (u["id"],))
                 rows = cur.fetchall()
         if not rows:
-            bot.reply_to(m, "لا يوجد سجلّ بعد.")
+            bot.reply_to(m, _t("history_empty", u["id"]))
             return
         lines = []
         for r in rows:
             mark = "✅" if r["ok"] else "❌"
             ts = r["created_at"].strftime("%m-%d %H:%M") if r["created_at"] else ""
             lines.append(f"{mark} {r['event_name']} → {r['status']}  {ts}")
-        bot.reply_to(m, "آخر العمليات:\n" + "\n".join(lines))
+        bot.reply_to(m, _t("history_title", u["id"]) + "\n" + "\n".join(lines))
 
     # ── /profile ─────────────────────────────────────────────────────────────
     @bot.message_handler(commands=["profile"])
@@ -1429,57 +1446,53 @@ def _register_handlers():
 
     @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("profile:"))
     def h_profile_cb(c):
+        bot.answer_callback_query(c.id)                       # dismiss spinner first
         u = _user_by_chat(c.message.chat.id)
         if not u:
-            bot.answer_callback_query(c.id, "أرسل /start أولاً")
             return
         action = c.data.split(":", 1)[1]
         if action == "device":
-            bot.answer_callback_query(c.id)
             kb = types.InlineKeyboardMarkup()
             kb.row(
                 types.InlineKeyboardButton("🤖 Android", callback_data="os:android"),
                 types.InlineKeyboardButton("🍎 iOS", callback_data="os:ios"),
             )
-            bot.send_message(c.message.chat.id, "اختر نظام التشغيل لجهاز الاختبار:", reply_markup=kb)
+            bot.send_message(c.message.chat.id, _t("choose_os", u["id"]), reply_markup=kb)
         elif action == "proxy":
             _set_state(u["id"], "proxy", {})
-            bot.answer_callback_query(c.id)
             bot.send_message(
-                c.message.chat.id,
-                "أرسل البروكسي (host:port أو user:pass@host:port):",
+                c.message.chat.id, _t("proxy_prompt", u["id"]),
                 reply_markup=types.ForceReply(selective=False),
             )
 
     @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("os:"))
     def h_os_cb(c):
+        bot.answer_callback_query(c.id)                       # dismiss spinner first
         u = _user_by_chat(c.message.chat.id)
         if not u:
-            bot.answer_callback_query(c.id, "أرسل /start أولاً")
             return
         os_ = c.data.split(":", 1)[1]
-        bot.answer_callback_query(c.id)
         if os_ == "android":
             _set_state(u["id"], "device_gaid", {"os": "android"})
-            bot.send_message(c.message.chat.id, "أرسل GAID:", reply_markup=types.ForceReply(selective=False))
+            bot.send_message(c.message.chat.id, _t("ask_gaid", u["id"]), parse_mode="HTML", reply_markup=types.ForceReply(selective=False))
         else:
             _set_state(u["id"], "device_idfa", {"os": "ios"})
-            bot.send_message(c.message.chat.id, "أرسل IDFA:", reply_markup=types.ForceReply(selective=False))
+            bot.send_message(c.message.chat.id, _t("ask_idfa", u["id"]), parse_mode="HTML", reply_markup=types.ForceReply(selective=False))
 
     # ── /settings ────────────────────────────────────────────────────────────
     @bot.message_handler(commands=["settings"])
     @linked
     def h_settings(m, u):
-        bot.send_message(m.chat.id, "⚙️ الإعدادات:", reply_markup=_settings_kb(u["id"]))
+        bot.send_message(m.chat.id, _t("settings_title", u["id"]), reply_markup=_settings_kb(u["id"]))
 
     @bot.callback_query_handler(func=lambda c: c.data == "settings:toggle")
     def h_settings_cb(c):
         u = _user_by_chat(c.message.chat.id)
         if not u:
-            bot.answer_callback_query(c.id, "أرسل /start أولاً")
+            bot.answer_callback_query(c.id, _t("need_start", 0))
             return
         _set_notify(u["id"], not _get_notify(u["id"]))
-        bot.answer_callback_query(c.id, "تم التحديث")
+        bot.answer_callback_query(c.id, _t("updated", u["id"]))
         try:
             bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=_settings_kb(u["id"]))
         except Exception:
@@ -1496,61 +1509,51 @@ def _register_handlers():
     @linked
     def h_add(m, u):
         _set_state(u["id"], "add_name", {})
-        _send_add_step(m.chat.id, "add_name", {})
+        _send_add_step(m.chat.id, "add_name", {}, uid=u["id"])
 
     @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("add:"))
     def h_add_cb(c):
+        bot.answer_callback_query(c.id)                       # dismiss spinner first
         u = _user_by_chat(c.message.chat.id)
         if not u:
-            bot.answer_callback_query(c.id, "أرسل /start أولاً")
             return
         action = c.data.split(":", 1)[1]
         if action == "cancel":
             _clear_state(u["id"])
-            bot.answer_callback_query(c.id, "أُلغي")
-            bot.send_message(c.message.chat.id, "❌ تم إلغاء إنشاء المهمة.")
+            bot.send_message(c.message.chat.id, _t("add_cancelled", u["id"]))
             return
         if action == "restart":
             _set_state(u["id"], "add_name", {})
-            bot.answer_callback_query(c.id)
-            _send_add_step(c.message.chat.id, "add_name", {})
+            _send_add_step(c.message.chat.id, "add_name", {}, uid=u["id"])
             return
         if action == "back":
             step, data = _get_state(u["id"])
             prev = _ADD_PREV.get(step)
-            bot.answer_callback_query(c.id)
             if prev:
                 _set_state(u["id"], prev, data)
-                _send_add_step(c.message.chat.id, prev, data)
+                _send_add_step(c.message.chat.id, prev, data, uid=u["id"])
             return
         if action == "save":
             step, data = _get_state(u["id"])
             if step != "awaiting_confirm":
-                bot.answer_callback_query(c.id, "انتهت الجلسة")
+                bot.send_message(c.message.chat.id, _t("session_over", u["id"]))
                 return
             if not all(data.get(k) for k in ("name", "package", "dev_key", "events")):
                 _clear_state(u["id"])
-                bot.answer_callback_query(c.id)
-                bot.send_message(c.message.chat.id, "بيانات ناقصة. أعد /add.")
+                bot.send_message(c.message.chat.id, _t("add_incomplete", u["id"]))
                 return
             jid = _save_add_job(u, data)
             _clear_state(u["id"])
-            bot.answer_callback_query(c.id, "تم الحفظ")
             if jid:
                 env = _get_env(u["id"])
                 ready = (env.get("os") and (env.get("gaid") or env.get("idfa")) and env.get("afid"))
-                note = "" if ready else "\n\n⚠️ بيئة جهازك غير مكتملة — أكملها عبر /profile قبل التشغيل."
-                bot.send_message(
-                    c.message.chat.id,
-                    f"✅ <b>تم حفظ المهمة</b> (#{jid}).\nستُنفَّذ خلال دقيقة عند أقرب مسح.{note}",
-                    parse_mode="HTML",
-                )
+                note = "" if ready else _t("add_saved_note", u["id"])
+                bot.send_message(c.message.chat.id, _t("add_saved", u["id"], id=jid, note=note), parse_mode="HTML")
             else:
-                bot.send_message(c.message.chat.id, "❌ تعذّر حفظ المهمة. حاول لاحقاً.")
+                bot.send_message(c.message.chat.id, _t("add_save_fail", u["id"]))
             return
         if action.startswith("exv:"):
             value = action[len("exv:"):]
-            bot.answer_callback_query(c.id)
             _add_advance(c.message.chat.id, u, value)
             return
 
@@ -1567,17 +1570,19 @@ def _register_handlers():
         target = _menu_target(m.text)
         if target == "add":
             _set_state(u["id"], "add_name", {})
-            _send_add_step(m.chat.id, "add_name", {})
+            _send_add_step(m.chat.id, "add_name", {}, uid=u["id"])
         elif target == "apps":
             _open_apps(m.chat.id, u)
         elif target == "profile":
             _open_profile(m.chat.id, u)
         elif target == "settings":
-            bot.send_message(m.chat.id, "⚙️ الإعدادات:", reply_markup=_settings_kb(u["id"]))
+            bot.send_message(m.chat.id, _t("settings_title", u["id"]), reply_markup=_settings_kb(u["id"]))
         elif target == "balance":
-            bot.send_message(m.chat.id, f"💳 رصيدك: {u['uses_left']} من {u['max_uses']}")
+            bot.send_message(m.chat.id, _t("balance_line", u["id"], left=u["uses_left"], max=u["max_uses"]))
         elif target == "services":
             _open_services(m.chat.id, u)
+        elif target == "language":
+            _send_lang_menu(m.chat.id, u["id"])
 
     # ── التدفّق المتسلسل: OS → فئة → تطبيق → جمع بيانات الجهاز ────────────────
     @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("nav:"))
@@ -1663,11 +1668,11 @@ def _register_handlers():
     def h_job_cb(c):
         u = _user_by_chat(c.message.chat.id)
         if not u:
-            bot.answer_callback_query(c.id, "أرسل /start أولاً")
+            bot.answer_callback_query(c.id, _t("need_start", 0))
             return
         action, _, sid = (c.data or "").partition(":")
         if not sid.isdigit():
-            bot.answer_callback_query(c.id, "أمر غير معروف")
+            bot.answer_callback_query(c.id, _t("unknown_cmd", u["id"]))
             return
         jid = int(sid)
         with get_conn() as conn:
@@ -1675,21 +1680,21 @@ def _register_handlers():
                 cur.execute("SELECT * FROM scheduled_jobs WHERE id=%s", (jid,))
                 job = cur.fetchone()
         if not job or (job["user_id"] != u["id"] and u["role"] != "admin"):
-            bot.answer_callback_query(c.id, "غير مصرّح")
+            bot.answer_callback_query(c.id, _t("not_allowed", u["id"]))
             return
         if action == "run":
             execute_job.apply_async(args=[jid], countdown=0)
-            bot.answer_callback_query(c.id, "▶️ أُرسلت")
+            bot.answer_callback_query(c.id, _t("job_run_toast", u["id"]))
         elif action == "tog":
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute("UPDATE scheduled_jobs SET enabled = 1 - enabled WHERE id=%s", (jid,))
-            bot.answer_callback_query(c.id, "تم التبديل")
+            bot.answer_callback_query(c.id, _t("job_toggled", u["id"]))
         elif action == "del":
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute("DELETE FROM scheduled_jobs WHERE id=%s", (jid,))
-            bot.answer_callback_query(c.id, "🗑 حُذفت")
+            bot.answer_callback_query(c.id, _t("job_deleted", u["id"]))
 
     # ── معالج النص (آلة الحالة) — محميّ بالكامل ───────────────────────────────
     def _text_step(chat_id):
@@ -1717,35 +1722,35 @@ def _register_handlers():
 
             # رفض الإدخال الفارغ للخطوات التي تتطلّب قيمة (نُبقي الحالة لإعادة المحاولة)
             if step in ("device_gaid", "device_idfa", "device_afid", "sniper_value") and not text:
-                bot.reply_to(m, "القيمة فارغة. أرسل قيمة صحيحة:",
+                bot.reply_to(m, _t("empty_value", u["id"]),
                              reply_markup=types.ForceReply(selective=False))
                 return
 
             if step == "device_gaid":
                 data["gaid"] = text
                 _set_state(u["id"], "device_afid", data)
-                bot.reply_to(m, "أرسل AFID:", reply_markup=types.ForceReply(selective=False))
+                bot.reply_to(m, _t("ask_afid", u["id"]), parse_mode="HTML", reply_markup=types.ForceReply(selective=False))
 
             elif step == "device_idfa":
                 data["idfa"] = text
                 _set_state(u["id"], "device_afid", data)
-                bot.reply_to(m, "أرسل AFID:", reply_markup=types.ForceReply(selective=False))
+                bot.reply_to(m, _t("ask_afid", u["id"]), parse_mode="HTML", reply_markup=types.ForceReply(selective=False))
 
             elif step == "device_afid":
                 _save_env(u["id"], os=data.get("os"), gaid=data.get("gaid", ""),
                           idfa=data.get("idfa", ""), afid=text)
                 _clear_state(u["id"])
-                bot.reply_to(m, "✅ تم حفظ بيانات الجهاز. (راجِعها بـ /profile)")
+                bot.reply_to(m, _t("device_saved", u["id"]))
 
             elif step == "proxy":
                 if text:
                     _save_env(u["id"], proxy=text)
-                    msg = "✅ تم حفظ البروكسي."
+                    msg = _t("proxy_saved", u["id"])
                 else:
                     env_now = _get_env(u["id"])
                     env_now.pop("proxy", None)
                     _ud_set(u["id"], "tg_env", json.dumps(env_now))
-                    msg = "✅ بدون بروكسي (تم التعطيل)."
+                    msg = _t("proxy_cleared", u["id"])
                 _clear_state(u["id"])
                 bot.reply_to(m, msg)
 
@@ -1795,11 +1800,11 @@ def _register_handlers():
                     bot.reply_to(m, _t("sched_ok", u["id"], event=html.escape(event), when=html.escape(when_txt)),
                                  parse_mode="HTML")
                 elif status == "invalid":
-                    bot.reply_to(m, _requirements_message(result))
+                    bot.reply_to(m, _requirements_message(result, u["id"]))
                 elif status == "balance":
                     bot.reply_to(m, _t("no_credits", u["id"]))
                 else:
-                    bot.reply_to(m, "تعذّرت الجدولة. أعد /apps.")
+                    bot.reply_to(m, _t("sched_fail", u["id"]))
             elif step == "edit_value":
                 job = _job_owned(data.get("job_id", 0), u)
                 field = data.get("field")
@@ -1815,21 +1820,35 @@ def _register_handlers():
                 _clear_state(u["id"])
                 for cid in _admin_chat_ids():
                     try:
-                        bot.send_message(int(cid), f"🆘 رسالة دعم من {u['username']} (#{u['id']}):\n{text}")
+                        bot.send_message(int(cid), _t("support_from", 0, user=u["username"], id=u["id"], text=text))
                     except Exception:
                         pass
                 bot.reply_to(m, _t("support_sent", u["id"]))
 
             else:
+                # foolproof: unknown state → reset and return to the main menu
                 _clear_state(u["id"])
+                bot.send_message(m.chat.id, _t("main_menu", u["id"]), reply_markup=_main_menu_kb(u["id"]))
         except Exception as e:
-            # تنظيف الحالة دائماً حتى لا يعلق المستخدم
+            # always clear state so the user can never get stuck
             logger.error(f"[Telegram] state '{step}' error: {e}")
             try:
                 _clear_state(u["id"])
             except Exception:
                 pass
-            bot.reply_to(m, "حدث خطأ غير متوقّع. أُعيد ضبط الجلسة — أعد المحاولة.")
+            bot.reply_to(m, _t("unexpected", u["id"]))
+
+    # ── Catch-all: any text not matched above → reset & show the main menu ────
+    # Registered last so commands, menu buttons and state-steps win first. This is
+    # the final guarantee that a user can never get stuck on unexpected input.
+    @bot.message_handler(func=lambda m: bool(m.text), content_types=["text"])
+    def h_fallback(m):
+        u = _user_by_chat(m.chat.id)
+        if not u:
+            bot.reply_to(m, locales.lookup("need_start"))
+            return
+        _clear_state(u["id"])
+        bot.send_message(m.chat.id, _t("main_menu", u["id"]), reply_markup=_main_menu_kb(u["id"]))
 
 
 _register_handlers()
