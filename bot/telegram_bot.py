@@ -60,7 +60,9 @@ TEXT_STEPS = {"device_gaid", "device_idfa", "device_afid", "sniper_value", "cust
               "task_gaid", "task_idfa", "task_afid",
               "add_name", "add_package", "add_devkey", "add_events",
               "edit_value", "support_msg",
-              "admin_user_credit", "admin_plan_edit", "admin_plan_new"}
+              "admin_user_credit", "admin_plan_edit",
+              "admin_wallet", "admin_broadcast",
+              "pw_key", "pw_en", "pw_ar", "pw_bn", "pw_credits", "pw_days", "pw_price"}
 
 
 def _default_dev_key() -> str:
@@ -318,6 +320,77 @@ def _create_plan(key):
             )
             return cur.rowcount > 0
 
+
+def _create_plan_full(key, label_en, label_ar, label_bn, credits, days, price):
+    """Insert a fully-specified plan (used by the guided Add-Plan wizard)."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO plans (key, label_en, label_ar, label_bn, credits, days, price, active, sort)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,1,99)
+                   ON CONFLICT (key) DO UPDATE SET
+                     label_en=EXCLUDED.label_en, label_ar=EXCLUDED.label_ar, label_bn=EXCLUDED.label_bn,
+                     credits=EXCLUDED.credits, days=EXCLUDED.days, price=EXCLUDED.price""",
+                (key, label_en, label_ar, label_bn, int(credits), int(days), price),
+            )
+            return True
+
+
+def _delete_plan(key) -> None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM plans WHERE key=%s", (key,))
+
+
+# ── Global app settings (e.g. crypto wallet address) ─────────────────────────
+def _get_setting(key, default=""):
+    _ensure_tables()
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT value FROM app_settings WHERE key=%s", (key,))
+                row = cur.fetchone()
+        return row["value"] if row and row.get("value") else default
+    except Exception:
+        return default
+
+
+def _set_setting(key, value) -> None:
+    _ensure_tables()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO app_settings (key, value) VALUES (%s,%s) "
+                "ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value",
+                (key, value),
+            )
+
+
+# ── Diagnostic / QA mode (per-user, persisted in user_data) ──────────────────
+def _get_diag(uid) -> bool:
+    return _ud_get(uid, "diag") == "1"
+
+
+def _set_diag(uid, on) -> None:
+    _ud_set(uid, "diag", "1" if on else "0")
+
+
+def _proxy_scheme(s) -> str:
+    """Extracts the scheme from a stored proxy URL (default http)."""
+    s = (s or "").strip().lower()
+    if "://" in s:
+        sc = s.split("://", 1)[0]
+        if sc in ("http", "https", "socks5", "socks5h", "socks4"):
+            return sc
+    return "http"
+
+
+def _all_user_chat_ids():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT tg_chat_id FROM users WHERE tg_chat_id IS NOT NULL AND tg_chat_id <> ''")
+            return [r["tg_chat_id"] for r in cur.fetchall()]
+
 _tables_ready = False
 
 
@@ -368,6 +441,11 @@ def _ensure_tables():
                         price     TEXT DEFAULT '',
                         active    INTEGER DEFAULT 1,
                         sort      INTEGER DEFAULT 0
+                    )""")
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS app_settings (
+                        key   TEXT PRIMARY KEY,
+                        value TEXT DEFAULT ''
                     )""")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_sub_user ON subscriptions(user_id)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_pay_status ON payments(status)")
@@ -597,8 +675,19 @@ def _open_admin(chat_id, u):
     kb.row(types.InlineKeyboardButton(_t("btn_admin_support", u["id"], n=ns_), callback_data="adm:sup"))
     kb.row(types.InlineKeyboardButton(_t("btn_admin_users", u["id"], n=nu_), callback_data="adm:users:0"))
     kb.row(types.InlineKeyboardButton(_t("btn_admin_plans", u["id"]), callback_data="adm:plans"))
+    kb.row(types.InlineKeyboardButton(_t("btn_admin_payset", u["id"]), callback_data="adm:payset"))
+    kb.row(types.InlineKeyboardButton(_t("btn_admin_broadcast", u["id"]), callback_data="adm:bc"))
     kb.row(_home_btn(u["id"]))
     bot.send_message(chat_id, _t("admin_menu_title", u["id"]), parse_mode="HTML", reply_markup=kb)
+
+
+def _admin_show_payset(chat_id, u):
+    wallet = _get_setting("wallet_address", "—")
+    kb = types.InlineKeyboardMarkup()
+    kb.row(types.InlineKeyboardButton(_t("btn_edit_wallet", u["id"]), callback_data="adm:setwallet"))
+    kb.row(_home_btn(u["id"]))
+    bot.send_message(chat_id, _t("admin_payset_view", u["id"], wallet=html.escape(str(wallet))),
+                     parse_mode="HTML", reply_markup=kb)
 
 
 def _admin_next_payment(chat_id, u):
@@ -711,6 +800,7 @@ def _admin_show_plan(chat_id, u, key):
     kb.row(types.InlineKeyboardButton(_t("btn_edit_label", u["id"], lang="EN"), callback_data=f"adm:pedit:{key}:label_en"),
            types.InlineKeyboardButton(_t("btn_edit_label", u["id"], lang="AR"), callback_data=f"adm:pedit:{key}:label_ar"),
            types.InlineKeyboardButton(_t("btn_edit_label", u["id"], lang="BN"), callback_data=f"adm:pedit:{key}:label_bn"))
+    kb.row(types.InlineKeyboardButton(_t("btn_del_plan", u["id"]), callback_data=f"adm:pdel:{key}"))
     kb.row(types.InlineKeyboardButton(_t("btn_admin_plans", u["id"]), callback_data="adm:plans"), _home_btn(u["id"]))
     bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=kb)
 
@@ -904,6 +994,34 @@ def _do_execute_now(chat_id, user, idx, value, env=None):
     if missing:
         bot.send_message(chat_id, _requirements_message(missing, user["id"]))
         return
+
+    # ── Diagnostic / QA mode: build and show the payload, send nothing, no credit ──
+    if _get_diag(user["id"]):
+        uid = user["id"]
+        dev_key = app_cfg.get("dev_key") or _default_dev_key() or ""
+        event_name = (value or "").strip() or app_cfg.get("event", "af_level_achieved")
+        os_ = (env.get("os") or "").lower()
+        body = {
+            "appsflyer_id": env.get("afid", "") or app_cfg.get("afid", ""),
+            "eventName": event_name,
+            "eventTime": datetime.now(timezone.utc).isoformat(),
+            "eventValue": "{}",
+        }
+        if os_ == "ios":
+            body["idfa"] = env.get("idfa", "")
+        else:
+            body["advertising_id"] = env.get("gaid", "") or app_cfg.get("gaid", "")
+        masked = (dev_key[:4] + "…" + str(len(dev_key)) + "c") if dev_key else "<none>"
+        url = f"https://api2.appsflyer.com/inappevent/{app_cfg['package']}"
+        headers_view = f"Content-Type: application/json | authentication: {masked}"
+        bot.send_message(
+            chat_id,
+            _t("diag_preview", uid, url=html.escape(url), headers=html.escape(headers_view),
+               payload=html.escape(json.dumps(body, ensure_ascii=False, indent=2))),
+            parse_mode="HTML",
+        )
+        return
+
     # credit/subscription gate (fast DB) — active subscription bypasses consumption
     consumed = False
     if _has_active_subscription(user["id"]):
@@ -1116,6 +1234,7 @@ def _schedule_test(user, idx, value, minutes, env=None):
     os_ = (env.get("os") or "").lower()
     device_id = env.get("idfa", "") if os_ == "ios" else env.get("gaid", "")
     p_host, p_port, p_user, p_pass = _proxy_parts(env.get("proxy", ""))
+    p_scheme = _proxy_scheme(env.get("proxy", ""))
     name = f"{app_cfg['name']} · {event_name}"
     events = json.dumps([{"name": event_name}])
 
@@ -1125,14 +1244,14 @@ def _schedule_test(user, idx, value, minutes, env=None):
                 cur.execute(
                     """INSERT INTO scheduled_jobs
                          (user_id, name, events, package, dev_key, gaid, afid, os,
-                          proxy_host, proxy_port, proxy_user, proxy_pass,
+                          proxy_host, proxy_port, proxy_user, proxy_pass, proxy_scheme,
                           run_at, enabled)
-                       VALUES (%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                       VALUES (%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                                NOW() + make_interval(mins => %s), 1)
                        RETURNING run_at""",
                     (user["id"], name, events, app_cfg["package"], dev_key,
                      device_id, env.get("afid", ""), os_,
-                     p_host, p_port, p_user, p_pass, minutes),
+                     p_host, p_port, p_user, p_pass, p_scheme, minutes),
                 )
                 run_at = cur.fetchone()["run_at"]
         return "ok", run_at
@@ -1280,6 +1399,7 @@ def _save_add_job(user, data):
     os_ = (env.get("os") or "").lower()
     device_id = env.get("idfa", "") if os_ == "ios" else env.get("gaid", "")
     p_host, p_port, p_user, p_pass = _proxy_parts(env.get("proxy", ""))
+    p_scheme = _proxy_scheme(env.get("proxy", ""))
     events = json.dumps([{"name": e} for e in data["events"]])
     try:
         with get_conn() as conn:
@@ -1287,11 +1407,11 @@ def _save_add_job(user, data):
                 cur.execute(
                     """INSERT INTO scheduled_jobs
                          (user_id, name, events, package, dev_key, gaid, afid, os,
-                          proxy_host, proxy_port, proxy_user, proxy_pass, run_at, enabled)
-                       VALUES (%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s, NOW(), 1)
+                          proxy_host, proxy_port, proxy_user, proxy_pass, proxy_scheme, run_at, enabled)
+                       VALUES (%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s, NOW(), 1)
                        RETURNING id""",
                     (user["id"], data["name"], events, data["package"], data["dev_key"],
-                     device_id, env.get("afid", ""), os_, p_host, p_port, p_user, p_pass),
+                     device_id, env.get("afid", ""), os_, p_host, p_port, p_user, p_pass, p_scheme),
                 )
                 return cur.fetchone()["id"]
     except Exception as e:
@@ -1336,6 +1456,8 @@ def _open_profile(chat_id, user):
         types.InlineKeyboardButton(_t("btn_upd_device", uid), callback_data="profile:device"),
         types.InlineKeyboardButton(_t("btn_upd_proxy", uid), callback_data="profile:proxy"),
     )
+    kb.row(types.InlineKeyboardButton(_t("btn_diag_toggle", uid), callback_data="profile:diag"))
+    kb.row(_home_btn(uid))
     bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=kb)
 
 
@@ -1411,22 +1533,6 @@ def _send_sub_status(chat_id, u):
                          parse_mode="HTML", reply_markup=kb)
     else:
         bot.send_message(chat_id, _t("sub_none", u["id"], credits=fresh["uses_left"]), reply_markup=kb)
-
-
-def _notify_admins_payment(payment_id, user, plan_key, screenshot):
-    """Sends the payment screenshot to each admin with approve/reject buttons."""
-    caption = _t("admin_pay_request", 0, id=payment_id,
-                 user=f"{user['username']} (#{user['id']})", plan=_plan_label(plan_key))
-    kb = types.InlineKeyboardMarkup()
-    kb.row(
-        types.InlineKeyboardButton(_t("btn_approve", 0), callback_data=f"pay:approve:{payment_id}"),
-        types.InlineKeyboardButton(_t("btn_reject", 0),  callback_data=f"pay:reject:{payment_id}"),
-    )
-    for cid in _admin_chat_ids():
-        try:
-            bot.send_photo(cid, screenshot, caption=caption, reply_markup=kb)
-        except Exception as e:
-            logger.warning(f"[Telegram] notify admin {cid} failed: {e}")
 
 
 def _user_jobs(user_id, limit=20):
@@ -1604,33 +1710,31 @@ def _register_handlers():
 
     @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("pay:"))
     def h_pay_cb(c):
+        bot.answer_callback_query(c.id)                       # absolute first: clear spinner
         u = _user_by_chat(c.message.chat.id)
         if not u:
-            bot.answer_callback_query(c.id)
             return
         parts = c.data.split(":")
         action = parts[1] if len(parts) > 1 else ""
-        # اختيار باقة → تعليمات + انتظار لقطة الشاشة
+        # plan chosen → instructions (with wallet) + wait for the screenshot
         if action == "plan" and len(parts) > 2:
             plan_key = parts[2]
             p = _get_plan(plan_key)
             if not p:
-                bot.answer_callback_query(c.id)
                 return
             _set_state(u["id"], "pay_screenshot", {"plan": plan_key})
-            bot.answer_callback_query(c.id)
+            wallet = _get_setting("wallet_address", "—")
             bot.send_message(
                 c.message.chat.id,
                 _t("pay_instructions", u["id"], plan=_plan_label(plan_key, u["id"]),
-                   credits=p["credits"], days=p["days"]),
+                   credits=p["credits"], days=p["days"], wallet=html.escape(str(wallet))),
                 parse_mode="HTML",
             )
             return
-        # قبول/رفض (للمشرفين فقط)
+        # approve / reject (admins only)
         if action in ("approve", "reject") and len(parts) > 2 and u["role"] == "admin":
             pid = int(parts[2]) if parts[2].isdigit() else 0
             row = _set_payment_status(pid, "approved" if action == "approve" else "rejected")
-            bot.answer_callback_query(c.id, _t("pay_done", u["id"]))
             if not row:
                 bot.send_message(c.message.chat.id, _t("pay_not_found", u["id"]))
                 return
@@ -1649,7 +1753,6 @@ def _register_handlers():
                     bot.send_message(int(target["tg_chat_id"]), _t("pay_rejected", target["id"]))
                 bot.send_message(c.message.chat.id, _t("pay_rejected_admin", u["id"], id=pid))
             return
-        bot.answer_callback_query(c.id)
 
     # استقبال لقطة الدفع (صورة) أثناء حالة pay_screenshot
     @bot.message_handler(content_types=["photo"])
@@ -1773,9 +1876,24 @@ def _register_handlers():
             _set_state(u["id"], "admin_plan_edit", {"key": key, "field": field})
             bot.send_message(cid, _t("admin_ask_value", u["id"], field=field),
                              parse_mode="HTML", reply_markup=types.ForceReply(selective=False))
+        elif action == "pdel" and len(parts) > 2:
+            _delete_plan(parts[2])
+            bot.send_message(cid, _t("plan_deleted", u["id"]))
+            _admin_show_plans(cid, u)
         elif action == "padd":
-            _set_state(u["id"], "admin_plan_new", {})
-            bot.send_message(cid, _t("admin_ask_newkey", u["id"]),
+            # guided wizard: key → en → ar → bn → credits → days → price
+            _set_state(u["id"], "pw_key", {})
+            bot.send_message(cid, _t("pw_ask_key", u["id"]), parse_mode="HTML",
+                             reply_markup=types.ForceReply(selective=False))
+        elif action == "payset":
+            _admin_show_payset(cid, u)
+        elif action == "setwallet":
+            _set_state(u["id"], "admin_wallet", {})
+            bot.send_message(cid, _t("admin_ask_wallet", u["id"]),
+                             reply_markup=types.ForceReply(selective=False))
+        elif action == "bc":
+            _set_state(u["id"], "admin_broadcast", {})
+            bot.send_message(cid, _t("admin_ask_broadcast", u["id"]), parse_mode="HTML",
                              reply_markup=types.ForceReply(selective=False))
 
     # ── Universal "🏠 Main menu" — clears any state, never a dead end ────────
@@ -1903,6 +2021,11 @@ def _register_handlers():
             kb.row(types.InlineKeyboardButton(_t("btn_cancel", u["id"]), callback_data="home"))
             bot.send_message(c.message.chat.id, _t("proxy_scheme", u["id"]),
                              parse_mode="HTML", reply_markup=kb)
+        elif action == "diag":
+            new = not _get_diag(u["id"])
+            _set_diag(u["id"], new)
+            bot.send_message(c.message.chat.id, _t("diag_on" if new else "diag_off", u["id"]),
+                             parse_mode="HTML")
 
     # ── Proxy wizard callbacks: scheme picker + auth yes/no ──────────────────
     @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("pxs:"))
@@ -1955,12 +2078,11 @@ def _register_handlers():
 
     @bot.callback_query_handler(func=lambda c: c.data == "settings:toggle")
     def h_settings_cb(c):
+        bot.answer_callback_query(c.id)                       # absolute first: clear spinner
         u = _user_by_chat(c.message.chat.id)
         if not u:
-            bot.answer_callback_query(c.id, _t("need_start", 0))
             return
         _set_notify(u["id"], not _get_notify(u["id"]))
-        bot.answer_callback_query(c.id, _t("updated", u["id"]))
         try:
             bot.edit_message_reply_markup(c.message.chat.id, c.message.message_id, reply_markup=_settings_kb(u["id"]))
         except Exception:
@@ -2055,11 +2177,10 @@ def _register_handlers():
     # ── التدفّق المتسلسل: OS → فئة → تطبيق → جمع بيانات الجهاز ────────────────
     @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("nav:"))
     def h_nav_cb(c):
+        bot.answer_callback_query(c.id)                       # absolute first: clear spinner
         u = _user_by_chat(c.message.chat.id)
         if not u:
-            bot.answer_callback_query(c.id, _t("need_start", 0))
             return
-        bot.answer_callback_query(c.id)
         parts = (c.data or "").split(":")
         action = parts[1] if len(parts) > 1 else ""
         chat = c.message.chat.id
@@ -2106,41 +2227,37 @@ def _register_handlers():
     # ── اختيار الوضع: 🎯 القناص (فوري) / ✍️ المخصّص (جدولة) ───────────────────
     @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("mode:"))
     def h_mode_cb(c):
+        bot.answer_callback_query(c.id)                       # absolute first: clear spinner
         u = _user_by_chat(c.message.chat.id)
         if not u:
-            bot.answer_callback_query(c.id, _t("need_start", 0))
             return
         action = c.data.split(":", 1)[1]
         if action == "cancel":
             _clear_state(u["id"])
-            bot.answer_callback_query(c.id)
             bot.send_message(c.message.chat.id, _t("reset_done", u["id"]), reply_markup=_main_menu_kb(u["id"]))
             return
         step, data = _get_state(u["id"])
         if step != "awaiting_mode":
-            bot.answer_callback_query(c.id, _t("session_over", u["id"]))
+            bot.send_message(c.message.chat.id, _t("session_over", u["id"]))
             return
         if action == "sniper":
             _set_state(u["id"], "sniper_value", data)
-            bot.answer_callback_query(c.id)
             bot.send_message(c.message.chat.id, _t("ask_event", u["id"]),
                              parse_mode="HTML", reply_markup=types.ForceReply(selective=False))
         elif action == "custom":
             _set_state(u["id"], "custom_input", data)
-            bot.answer_callback_query(c.id)
             bot.send_message(c.message.chat.id, _t("ask_delay", u["id"]),
                              parse_mode="HTML", reply_markup=types.ForceReply(selective=False))
 
     # ── أزرار المهام القديمة ──────────────────────────────────────────────────
     @bot.callback_query_handler(func=lambda c: (c.data or "").split(":")[0] in ("run", "tog", "del"))
     def h_job_cb(c):
+        bot.answer_callback_query(c.id)                       # absolute first: clear spinner
         u = _user_by_chat(c.message.chat.id)
         if not u:
-            bot.answer_callback_query(c.id, _t("need_start", 0))
             return
         action, _, sid = (c.data or "").partition(":")
         if not sid.isdigit():
-            bot.answer_callback_query(c.id, _t("unknown_cmd", u["id"]))
             return
         jid = int(sid)
         with get_conn() as conn:
@@ -2148,21 +2265,21 @@ def _register_handlers():
                 cur.execute("SELECT * FROM scheduled_jobs WHERE id=%s", (jid,))
                 job = cur.fetchone()
         if not job or (job["user_id"] != u["id"] and u["role"] != "admin"):
-            bot.answer_callback_query(c.id, _t("not_allowed", u["id"]))
+            bot.send_message(c.message.chat.id, _t("not_allowed", u["id"]))
             return
         if action == "run":
             execute_job.apply_async(args=[jid], countdown=0)
-            bot.answer_callback_query(c.id, _t("job_run_toast", u["id"]))
+            bot.send_message(c.message.chat.id, _t("job_run_toast", u["id"]))
         elif action == "tog":
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute("UPDATE scheduled_jobs SET enabled = 1 - enabled WHERE id=%s", (jid,))
-            bot.answer_callback_query(c.id, _t("job_toggled", u["id"]))
+            bot.send_message(c.message.chat.id, _t("job_toggled", u["id"]))
         elif action == "del":
             with get_conn() as conn:
                 with conn.cursor() as cur:
                     cur.execute("DELETE FROM scheduled_jobs WHERE id=%s", (jid,))
-            bot.answer_callback_query(c.id, _t("job_deleted", u["id"]))
+            bot.send_message(c.message.chat.id, _t("job_deleted", u["id"]))
 
     # ── معالج النص (آلة الحالة) — محميّ بالكامل ───────────────────────────────
     def _text_step(chat_id):
@@ -2342,14 +2459,83 @@ def _register_handlers():
                 _admin_show_plan(m.chat.id, u, key)
 
             elif step == "admin_plan_new" and u["role"] == "admin":
-                _clear_state(u["id"])
+                _clear_state(u["id"])      # legacy path retired by the guided wizard below
+
+            # ── Guided Add-Plan wizard: key → en → ar → bn → credits → days → price ──
+            elif step == "pw_key" and u["role"] == "admin":
                 key = re.sub(r"[^A-Za-z0-9]", "", text)[:16]
                 if not key:
-                    bot.reply_to(m, _t("admin_ask_newkey", u["id"]))
+                    bot.reply_to(m, _t("pw_ask_key", u["id"]), parse_mode="HTML",
+                                 reply_markup=types.ForceReply(selective=False))
                     return
-                _create_plan(key)
-                bot.reply_to(m, _t("admin_plan_created", u["id"]))
-                _admin_show_plan(m.chat.id, u, key)
+                data["key"] = key
+                _set_state(u["id"], "pw_en", data)
+                bot.reply_to(m, _t("pw_ask_en", u["id"]), parse_mode="HTML",
+                             reply_markup=types.ForceReply(selective=False))
+            elif step == "pw_en" and u["role"] == "admin":
+                data["en"] = text
+                _set_state(u["id"], "pw_ar", data)
+                bot.reply_to(m, _t("pw_ask_ar", u["id"]), parse_mode="HTML",
+                             reply_markup=types.ForceReply(selective=False))
+            elif step == "pw_ar" and u["role"] == "admin":
+                data["ar"] = text
+                _set_state(u["id"], "pw_bn", data)
+                bot.reply_to(m, _t("pw_ask_bn", u["id"]), parse_mode="HTML",
+                             reply_markup=types.ForceReply(selective=False))
+            elif step == "pw_bn" and u["role"] == "admin":
+                data["bn"] = text
+                _set_state(u["id"], "pw_credits", data)
+                bot.reply_to(m, _t("pw_ask_credits", u["id"]), parse_mode="HTML",
+                             reply_markup=types.ForceReply(selective=False))
+            elif step == "pw_credits" and u["role"] == "admin":
+                if not text.isdigit():
+                    bot.reply_to(m, _t("pw_ask_credits", u["id"]), parse_mode="HTML",
+                                 reply_markup=types.ForceReply(selective=False))
+                    return
+                data["credits"] = int(text)
+                _set_state(u["id"], "pw_days", data)
+                bot.reply_to(m, _t("pw_ask_days", u["id"]), parse_mode="HTML",
+                             reply_markup=types.ForceReply(selective=False))
+            elif step == "pw_days" and u["role"] == "admin":
+                if not text.isdigit():
+                    bot.reply_to(m, _t("pw_ask_days", u["id"]), parse_mode="HTML",
+                                 reply_markup=types.ForceReply(selective=False))
+                    return
+                data["days"] = int(text)
+                _set_state(u["id"], "pw_price", data)
+                bot.reply_to(m, _t("pw_ask_price", u["id"]), parse_mode="HTML",
+                             reply_markup=types.ForceReply(selective=False))
+            elif step == "pw_price" and u["role"] == "admin":
+                _clear_state(u["id"])
+                _create_plan_full(data["key"], data.get("en", data["key"]), data.get("ar", data["key"]),
+                                  data.get("bn", data["key"]), data.get("credits", 0), data.get("days", 0), text)
+                bot.reply_to(m, _t("plan_created2", u["id"], key=html.escape(data["key"])), parse_mode="HTML")
+                _admin_show_plan(m.chat.id, u, data["key"])
+
+            elif step == "admin_wallet" and u["role"] == "admin":
+                _clear_state(u["id"])
+                _set_setting("wallet_address", text)
+                bot.reply_to(m, _t("admin_wallet_saved", u["id"]))
+
+            elif step == "admin_broadcast" and u["role"] == "admin":
+                _clear_state(u["id"])
+                chat_ids = _all_user_chat_ids()
+                announcement = text
+
+                def _do_broadcast():
+                    sent = 0
+                    for cid in chat_ids:
+                        try:
+                            bot.send_message(int(cid), announcement)
+                            sent += 1
+                        except Exception:
+                            pass
+                    try:
+                        bot.send_message(m.chat.id, _t("admin_broadcast_done", u["id"], n=sent))
+                    except Exception:
+                        pass
+
+                _bg(_do_broadcast)         # async — never blocks the webhook thread
 
             else:
                 # foolproof: unknown state → reset and return to the main menu
