@@ -23,6 +23,7 @@ import hashlib
 import html
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from datetime import datetime, timezone
 
@@ -54,10 +55,12 @@ else:
 
 FREE_USES = 5
 # خطوات تتطلّب إدخالاً نصّياً (تُلتقط بمعالج النص)
-TEXT_STEPS = {"device_gaid", "device_idfa", "device_afid", "proxy", "sniper_value", "custom_input",
+TEXT_STEPS = {"device_gaid", "device_idfa", "device_afid", "sniper_value", "custom_input",
+              "proxy_host", "proxy_port", "proxy_user", "proxy_pass",
               "task_gaid", "task_idfa", "task_afid",
               "add_name", "add_package", "add_devkey", "add_events",
-              "edit_value", "support_msg"}
+              "edit_value", "support_msg",
+              "admin_user_credit", "admin_plan_edit", "admin_plan_new"}
 
 
 def _default_dev_key() -> str:
@@ -249,10 +252,71 @@ def _nav_back(user_id):
 # ═══════════════════════════════════════════════════════════════════════════════
 # الاشتراكات والمدفوعات (جداول جديدة) — المطلبان 7 و8
 # ═══════════════════════════════════════════════════════════════════════════════
-PLANS = {
-    "w": {"days": 7,  "credits": 50,  "label_ar": "أسبوعي", "label_en": "Weekly"},
-    "m": {"days": 30, "credits": 200, "label_ar": "شهري",   "label_en": "Monthly"},
+# Seed values only — the live source of truth is the `plans` table (admin-editable).
+_DEFAULT_PLANS = {
+    "w": {"days": 7,  "credits": 50,  "label_ar": "أسبوعي", "label_en": "Weekly",  "label_bn": "সাপ্তাহিক", "price": ""},
+    "m": {"days": 30, "credits": 200, "label_ar": "شهري",   "label_en": "Monthly", "label_bn": "মাসিক",     "price": ""},
 }
+
+
+def _get_plans(active_only=True):
+    """Ordered dict of plans from DB (falls back to the seed if the table is empty)."""
+    _ensure_tables()
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                q = "SELECT * FROM plans"
+                if active_only:
+                    q += " WHERE active=1"
+                q += " ORDER BY sort ASC, key ASC"
+                cur.execute(q)
+                rows = cur.fetchall()
+        if rows:
+            return {r["key"]: dict(r) for r in rows}
+    except Exception as e:
+        logger.warning(f"[Telegram] load plans failed: {e}")
+    return dict(_DEFAULT_PLANS)
+
+
+def _get_plan(key):
+    if not key:
+        return None
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT * FROM plans WHERE key=%s", (key,))
+                row = cur.fetchone()
+        if row:
+            return dict(row)
+    except Exception:
+        pass
+    return _DEFAULT_PLANS.get(key)
+
+
+def _update_plan(key, **fields):
+    allowed = {"label_en", "label_ar", "label_bn", "credits", "days", "price", "active", "sort"}
+    sets, vals = [], []
+    for k, v in fields.items():
+        if k in allowed:
+            sets.append(f"{k}=%s"); vals.append(v)
+    if not sets:
+        return False
+    vals.append(key)
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(f"UPDATE plans SET {', '.join(sets)} WHERE key=%s", vals)
+            return cur.rowcount > 0
+
+
+def _create_plan(key):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO plans (key, label_en, label_ar, label_bn, credits, days, active, sort) "
+                "VALUES (%s,%s,%s,%s,0,0,1,99) ON CONFLICT (key) DO NOTHING",
+                (key, key, key, key),
+            )
+            return cur.rowcount > 0
 
 _tables_ready = False
 
@@ -284,18 +348,50 @@ def _ensure_tables():
                         created_at   TIMESTAMPTZ DEFAULT NOW(),
                         reviewed_at  TIMESTAMPTZ
                     )""")
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS support_tickets (
+                        id         SERIAL PRIMARY KEY,
+                        user_id    INTEGER NOT NULL,
+                        message    TEXT,
+                        status     TEXT DEFAULT 'unread',
+                        created_at TIMESTAMPTZ DEFAULT NOW(),
+                        read_at    TIMESTAMPTZ
+                    )""")
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS plans (
+                        key       TEXT PRIMARY KEY,
+                        label_en  TEXT DEFAULT '',
+                        label_ar  TEXT DEFAULT '',
+                        label_bn  TEXT DEFAULT '',
+                        credits   INTEGER DEFAULT 0,
+                        days      INTEGER DEFAULT 0,
+                        price     TEXT DEFAULT '',
+                        active    INTEGER DEFAULT 1,
+                        sort      INTEGER DEFAULT 0
+                    )""")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_sub_user ON subscriptions(user_id)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_pay_status ON payments(status)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_ticket_status ON support_tickets(status)")
+                # seed default plans once (admin can edit/extend them afterwards)
+                for i, (k, p) in enumerate(_DEFAULT_PLANS.items()):
+                    cur.execute(
+                        """INSERT INTO plans (key, label_en, label_ar, label_bn, credits, days, price, active, sort)
+                           VALUES (%s,%s,%s,%s,%s,%s,%s,1,%s) ON CONFLICT (key) DO NOTHING""",
+                        (k, p["label_en"], p["label_ar"], p.get("label_bn", p["label_en"]),
+                         p["credits"], p["days"], p.get("price", ""), i),
+                    )
         _tables_ready = True
     except Exception as e:
         logger.warning(f"[Telegram] ensure tables failed: {e}")
 
 
 def _plan_label(plan_key, uid=None):
-    p = PLANS.get(plan_key)
+    p = _get_plan(plan_key)
     if not p:
         return plan_key
-    return p["label_en"] if (uid and _lang(uid) == "en") else p["label_ar"]
+    lang = _lang(uid) if uid else locales.DEFAULT_LANG
+    label = p.get(f"label_{lang}") or p.get("label_en") or p.get("label_ar") or plan_key
+    return label
 
 
 def _has_active_subscription(user_id) -> bool:
@@ -361,8 +457,8 @@ def _list_pending_payments(limit=10):
 
 
 def _grant_subscription(user_id, plan_key):
-    """يفعّل اشتراكاً ويضيف الرصيد (يُستدعى عند قبول الدفع)."""
-    p = PLANS.get(plan_key)
+    """Activates a subscription and adds credits (called on payment approval/admin grant)."""
+    p = _get_plan(plan_key)
     if not p:
         return None
     with get_conn() as conn:
@@ -371,12 +467,12 @@ def _grant_subscription(user_id, plan_key):
                 """INSERT INTO subscriptions (user_id, plan, status, expires_at)
                    VALUES (%s,%s,'active', NOW() + make_interval(days => %s))
                    RETURNING expires_at""",
-                (user_id, plan_key, p["days"]),
+                (user_id, plan_key, int(p["days"])),
             )
             expires = cur.fetchone()["expires_at"]
             cur.execute(
                 "UPDATE users SET uses_left = uses_left + %s, max_uses = max_uses + %s WHERE id=%s",
-                (p["credits"], p["credits"], user_id),
+                (int(p["credits"]), int(p["credits"]), user_id),
             )
     return expires
 
@@ -396,6 +492,227 @@ def _admin_chat_ids():
         with conn.cursor() as cur:
             cur.execute("SELECT tg_chat_id FROM users WHERE role='admin' AND tg_chat_id IS NOT NULL")
             return [r["tg_chat_id"] for r in cur.fetchall()]
+
+
+# ── Support tickets + admin counters (silent inbox, no push spam) ────────────
+def _create_ticket(user_id, message) -> int | None:
+    _ensure_tables()
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO support_tickets (user_id, message, status) VALUES (%s,%s,'unread') RETURNING id",
+                    (user_id, message),
+                )
+                return cur.fetchone()["id"]
+    except Exception as e:
+        logger.error(f"[Telegram] create ticket failed: {e}")
+        return None
+
+
+def _count_pending_payments() -> int:
+    _ensure_tables()
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) AS n FROM payments WHERE status='pending'")
+                return int(cur.fetchone()["n"])
+    except Exception:
+        return 0
+
+
+def _count_unread_tickets() -> int:
+    _ensure_tables()
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) AS n FROM support_tickets WHERE status='unread'")
+                return int(cur.fetchone()["n"])
+    except Exception:
+        return 0
+
+
+def _next_unread_ticket():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM support_tickets WHERE status='unread' ORDER BY id ASC LIMIT 1")
+            return cur.fetchone()
+
+
+def _mark_ticket_read(tid) -> None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE support_tickets SET status='read', read_at=NOW() WHERE id=%s", (tid,))
+
+
+def _home_btn(uid):
+    """A universal '🏠 Main menu' button — drop into any deep menu to avoid dead ends."""
+    return types.InlineKeyboardButton(_t("btn_home", uid), callback_data="home")
+
+
+def _count_users() -> int:
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) AS n FROM users")
+                return int(cur.fetchone()["n"])
+    except Exception:
+        return 0
+
+
+def _list_users(offset=0, limit=8):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, username, role, uses_left, max_uses FROM users ORDER BY id ASC OFFSET %s LIMIT %s",
+                (offset, limit),
+            )
+            return cur.fetchall()
+
+
+def _admin_add_credits(uid, n) -> None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET uses_left = GREATEST(0, uses_left + %s), "
+                "max_uses = GREATEST(max_uses, uses_left + %s) WHERE id=%s",
+                (n, n, uid),
+            )
+
+
+def _delete_user(uid) -> None:
+    """Removes a user and all dependent rows (FK-cascade + the FK-less tables)."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            for t in ("subscriptions", "payments", "support_tickets"):
+                cur.execute(f"DELETE FROM {t} WHERE user_id=%s", (uid,))
+            cur.execute("DELETE FROM users WHERE id=%s", (uid,))   # cascades the rest
+
+
+# ── Admin dashboard renderers (module-level; HTML, each ends with a Home btn) ─
+def _open_admin(chat_id, u):
+    np_, ns_, nu_ = _count_pending_payments(), _count_unread_tickets(), _count_users()
+    kb = types.InlineKeyboardMarkup()
+    kb.row(types.InlineKeyboardButton(_t("btn_admin_payments", u["id"], n=np_), callback_data="adm:pay"))
+    kb.row(types.InlineKeyboardButton(_t("btn_admin_support", u["id"], n=ns_), callback_data="adm:sup"))
+    kb.row(types.InlineKeyboardButton(_t("btn_admin_users", u["id"], n=nu_), callback_data="adm:users:0"))
+    kb.row(types.InlineKeyboardButton(_t("btn_admin_plans", u["id"]), callback_data="adm:plans"))
+    kb.row(_home_btn(u["id"]))
+    bot.send_message(chat_id, _t("admin_menu_title", u["id"]), parse_mode="HTML", reply_markup=kb)
+
+
+def _admin_next_payment(chat_id, u):
+    pend = _list_pending_payments(limit=1)
+    if not pend:
+        bot.send_message(chat_id, _t("no_pending_pay", u["id"]))
+        _open_admin(chat_id, u)
+        return
+    pay = pend[0]
+    target = _user_by_id(pay["user_id"])
+    cap = _t("admin_pay_request", u["id"], id=pay["id"],
+             user=(target["username"] if target else pay["user_id"]), plan=_plan_label(pay["plan"], u["id"]))
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton(_t("btn_approve", u["id"]), callback_data=f"pay:approve:{pay['id']}"),
+        types.InlineKeyboardButton(_t("btn_reject", u["id"]),  callback_data=f"pay:reject:{pay['id']}"),
+    )
+    kb.row(types.InlineKeyboardButton(_t("btn_next", u["id"]), callback_data="adm:pay"), _home_btn(u["id"]))
+    try:
+        bot.send_photo(chat_id, pay["screenshot"], caption=cap, reply_markup=kb)
+    except Exception:
+        bot.send_message(chat_id, cap, reply_markup=kb)
+
+
+def _admin_next_ticket(chat_id, u):
+    t = _next_unread_ticket()
+    if not t:
+        bot.send_message(chat_id, _t("admin_no_support", u["id"]))
+        _open_admin(chat_id, u)
+        return
+    _mark_ticket_read(t["id"])
+    target = _user_by_id(t["user_id"])
+    when = t["created_at"].strftime("%Y-%m-%d %H:%M") if hasattr(t["created_at"], "strftime") else str(t["created_at"])
+    txt = _t("support_ticket_view", u["id"], id=t["id"],
+             user=html.escape(str(target["username"] if target else "?")), uid=t["user_id"],
+             when=when, text=html.escape(str(t["message"] or "")))
+    kb = types.InlineKeyboardMarkup()
+    kb.row(types.InlineKeyboardButton(_t("btn_next", u["id"]), callback_data="adm:sup"), _home_btn(u["id"]))
+    bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=kb)
+
+
+def _admin_show_users(chat_id, u, offset=0):
+    rows = _list_users(offset=offset, limit=8)
+    kb = types.InlineKeyboardMarkup()
+    for r in rows:
+        kb.row(types.InlineKeyboardButton(
+            f"#{r['id']} {r['username']} · {r['uses_left']}/{r['max_uses']}",
+            callback_data=f"adm:user:{r['id']}"))
+    nav = []
+    if offset > 0:
+        nav.append(types.InlineKeyboardButton(_t("btn_prev", u["id"]), callback_data=f"adm:users:{max(0, offset-8)}"))
+    if len(rows) == 8:
+        nav.append(types.InlineKeyboardButton(_t("btn_more", u["id"]), callback_data=f"adm:users:{offset+8}"))
+    if nav:
+        kb.row(*nav)
+    kb.row(_home_btn(u["id"]))
+    bot.send_message(chat_id, _t("admin_users_title", u["id"]), parse_mode="HTML", reply_markup=kb)
+
+
+def _admin_show_user(chat_id, u, target_uid):
+    t = _user_by_id(target_uid)
+    if not t:
+        _admin_show_users(chat_id, u, 0)
+        return
+    txt = _t("admin_user_view", u["id"], username=html.escape(str(t["username"])), uid=t["id"],
+             role=t["role"], left=t["uses_left"], max=t["max_uses"])
+    kb = types.InlineKeyboardMarkup()
+    kb.row(types.InlineKeyboardButton(_t("btn_add_credits", u["id"]), callback_data=f"adm:ucredit:{t['id']}"),
+           types.InlineKeyboardButton(_t("btn_grant_plan", u["id"]), callback_data=f"adm:uplan:{t['id']}"))
+    kb.row(types.InlineKeyboardButton(_t("btn_del_user", u["id"]), callback_data=f"adm:udel:{t['id']}"))
+    kb.row(types.InlineKeyboardButton(_t("btn_admin_users", u["id"], n=_count_users()), callback_data="adm:users:0"),
+           _home_btn(u["id"]))
+    bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=kb)
+
+
+def _admin_grant_menu(chat_id, u, target_uid):
+    kb = types.InlineKeyboardMarkup()
+    for key, p in _get_plans(active_only=False).items():
+        kb.row(types.InlineKeyboardButton(
+            f"{_plan_label(key, u['id'])} · {p['credits']}/{p['days']}d",
+            callback_data=f"adm:ugrant:{target_uid}:{key}"))
+    kb.row(types.InlineKeyboardButton(_t("btn_back", u["id"]), callback_data=f"adm:user:{target_uid}"))
+    bot.send_message(chat_id, _t("choose_plan", u["id"]), reply_markup=kb)
+
+
+def _admin_show_plans(chat_id, u):
+    kb = types.InlineKeyboardMarkup()
+    for key, p in _get_plans(active_only=False).items():
+        flag = "✅" if p.get("active", 1) else "⛔"
+        kb.row(types.InlineKeyboardButton(f"{flag} {key} · {_plan_label(key, u['id'])}",
+                                          callback_data=f"adm:plan:{key}"))
+    kb.row(types.InlineKeyboardButton(_t("btn_add_plan", u["id"]), callback_data="adm:padd"))
+    kb.row(_home_btn(u["id"]))
+    bot.send_message(chat_id, _t("admin_plans_title", u["id"]), parse_mode="HTML", reply_markup=kb)
+
+
+def _admin_show_plan(chat_id, u, key):
+    p = _get_plan(key)
+    if not p:
+        _admin_show_plans(chat_id, u)
+        return
+    txt = _t("admin_plan_view", u["id"], key=key, label=html.escape(str(_plan_label(key, u["id"]))),
+             credits=p["credits"], days=p["days"], price=html.escape(str(p.get("price") or "—")),
+             active=("✅" if p.get("active", 1) else "⛔"))
+    kb = types.InlineKeyboardMarkup()
+    kb.row(types.InlineKeyboardButton(_t("btn_edit_credits", u["id"]), callback_data=f"adm:pedit:{key}:credits"),
+           types.InlineKeyboardButton(_t("btn_edit_days", u["id"]), callback_data=f"adm:pedit:{key}:days"))
+    kb.row(types.InlineKeyboardButton(_t("btn_edit_price", u["id"]), callback_data=f"adm:pedit:{key}:price"),
+           types.InlineKeyboardButton(_t("btn_toggle_active", u["id"]), callback_data=f"adm:ptoggle:{key}"))
+    kb.row(types.InlineKeyboardButton(_t("btn_edit_label", u["id"], lang="EN"), callback_data=f"adm:pedit:{key}:label_en"),
+           types.InlineKeyboardButton(_t("btn_edit_label", u["id"], lang="AR"), callback_data=f"adm:pedit:{key}:label_ar"),
+           types.InlineKeyboardButton(_t("btn_edit_label", u["id"], lang="BN"), callback_data=f"adm:pedit:{key}:label_bn"))
+    kb.row(types.InlineKeyboardButton(_t("btn_admin_plans", u["id"]), callback_data="adm:plans"), _home_btn(u["id"]))
+    bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=kb)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -447,6 +764,28 @@ def _proxy_parts(s):
         hostport = s
     host, _, port = hostport.partition(":")
     return host, port, user, pw
+
+
+def _build_proxy_url(scheme, host, port, user="", pw=""):
+    """Builds scheme://[user:pass@]host:port with URL-encoded credentials."""
+    from urllib.parse import quote
+    scheme = (scheme or "http").lower()
+    creds = ""
+    if user:
+        creds = f"{quote(str(user), safe='')}:{quote(str(pw or ''), safe='')}@"
+    return f"{scheme}://{creds}{host}:{port}"
+
+
+def _finish_proxy(chat_id, u, data):
+    """Assembles the proxy URL from wizard data, saves it, returns to main menu."""
+    url = _build_proxy_url(data.get("scheme"), data.get("host", ""), data.get("port", ""),
+                           data.get("user", ""), data.get("pass", ""))
+    _save_env(u["id"], proxy=url)
+    _clear_state(u["id"])
+    kb = types.InlineKeyboardMarkup()
+    kb.row(_home_btn(u["id"]))
+    bot.send_message(chat_id, _t("proxy_saved", u["id"]) + f"\n<code>{html.escape(url)}</code>",
+                     parse_mode="HTML", reply_markup=kb)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1046,26 +1385,32 @@ def _open_services(chat_id, u):
     kb.row(types.InlineKeyboardButton(_t("btn_subscribe", u["id"]),  callback_data="svc:plans"))
     kb.row(types.InlineKeyboardButton(_t("btn_sub_status", u["id"]), callback_data="svc:status"))
     kb.row(types.InlineKeyboardButton(_t("btn_support", u["id"]),    callback_data="svc:support"))
+    kb.row(_home_btn(u["id"]))
     bot.send_message(chat_id, _t("services_menu", u["id"]), reply_markup=kb)
 
 
 def _send_plans(chat_id, u):
     kb = types.InlineKeyboardMarkup()
-    for key, p in PLANS.items():
-        label = f"{_plan_label(key, u['id'])} · {p['credits']}/{p['days']}d"
+    for key, p in _get_plans().items():
+        price = f" · {p['price']}" if p.get("price") else ""
+        label = f"{_plan_label(key, u['id'])} · {p['credits']}/{p['days']}d{price}"
         kb.row(types.InlineKeyboardButton(label, callback_data=f"pay:plan:{key}"))
     kb.row(types.InlineKeyboardButton(_t("btn_cancel", u["id"]), callback_data="svc:close"))
+    kb.row(_home_btn(u["id"]))
     bot.send_message(chat_id, _t("choose_plan", u["id"]), reply_markup=kb)
 
 
 def _send_sub_status(chat_id, u):
     expiry = _sub_expiry(u["id"])
     fresh = _user_by_chat(chat_id) or u
+    kb = types.InlineKeyboardMarkup()
+    kb.row(_home_btn(u["id"]))
     if expiry:
         until = expiry.strftime("%Y-%m-%d") if hasattr(expiry, "strftime") else str(expiry)
-        bot.send_message(chat_id, _t("sub_active", u["id"], until=until, credits=fresh["uses_left"]), parse_mode="HTML")
+        bot.send_message(chat_id, _t("sub_active", u["id"], until=until, credits=fresh["uses_left"]),
+                         parse_mode="HTML", reply_markup=kb)
     else:
-        bot.send_message(chat_id, _t("sub_none", u["id"], credits=fresh["uses_left"]))
+        bot.send_message(chat_id, _t("sub_none", u["id"], credits=fresh["uses_left"]), reply_markup=kb)
 
 
 def _notify_admins_payment(payment_id, user, plan_key, screenshot):
@@ -1106,13 +1451,15 @@ def _job_owned(job_id, user):
 
 def _open_jobs(chat_id, u):
     jobs = _user_jobs(u["id"])
-    if not jobs:
-        bot.send_message(chat_id, _t("jobs_empty", u["id"]))
-        return
     kb = types.InlineKeyboardMarkup()
+    if not jobs:
+        kb.row(_home_btn(u["id"]))
+        bot.send_message(chat_id, _t("jobs_empty", u["id"]), reply_markup=kb)
+        return
     for j in jobs:
         mark = "✅" if j["enabled"] else "⏸️"
         kb.row(types.InlineKeyboardButton(f"{mark} {j['name']}", callback_data=f"job:view:{j['id']}"))
+    kb.row(_home_btn(u["id"]))
     bot.send_message(chat_id, _t("jobs_title", u["id"]), reply_markup=kb)
 
 
@@ -1266,7 +1613,7 @@ def _register_handlers():
         # اختيار باقة → تعليمات + انتظار لقطة الشاشة
         if action == "plan" and len(parts) > 2:
             plan_key = parts[2]
-            p = PLANS.get(plan_key)
+            p = _get_plan(plan_key)
             if not p:
                 bot.answer_callback_query(c.id)
                 return
@@ -1291,7 +1638,7 @@ def _register_handlers():
             if action == "approve":
                 expires = _grant_subscription(row["user_id"], row["plan"])
                 until = expires.strftime("%Y-%m-%d") if hasattr(expires, "strftime") else str(expires)
-                p = PLANS.get(row["plan"], {})
+                p = _get_plan(row["plan"]) or {}
                 if target and target.get("tg_chat_id"):
                     bot.send_message(int(target["tg_chat_id"]),
                                      _t("pay_approved", target["id"], plan=_plan_label(row["plan"], target["id"]),
@@ -1318,7 +1665,8 @@ def _register_handlers():
         _clear_state(u["id"])
         pid = _create_payment(u["id"], plan_key, file_id)
         if pid:
-            _notify_admins_payment(pid, u, plan_key, file_id)
+            # Saved silently as 'pending' — admins review it from the /admin dashboard
+            # (no direct push to admin chats anymore).
             bot.reply_to(m, _t("pay_received", u["id"]))
         else:
             bot.reply_to(m, _t("pay_record_fail", u["id"]))
@@ -1348,11 +1696,98 @@ def _register_handlers():
             except Exception:
                 bot.send_message(m.chat.id, cap, reply_markup=kb)
 
-    # ── /jobs — قائمة المهام + التحرير (المطلب 8) ────────────────────────────
-    @bot.message_handler(commands=["jobs"])
+    # ── /admin — dashboard (replaces direct push of payments/support) ────────
+    @bot.message_handler(commands=["admin"])
     @linked
-    def h_jobs(m, u):
-        _open_jobs(m.chat.id, u)
+    def h_admin(m, u):
+        if u["role"] != "admin":
+            bot.reply_to(m, _t("admins_only", u["id"]))
+            return
+        _open_admin(m.chat.id, u)
+
+    @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("adm:"))
+    def h_admin_cb(c):
+        bot.answer_callback_query(c.id)                       # instant ack
+        u = _user_by_chat(c.message.chat.id)
+        if not u or u["role"] != "admin":
+            return
+        parts = (c.data or "").split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        cid = c.message.chat.id
+        if action == "home":
+            _open_admin(cid, u)
+        elif action == "pay":
+            _admin_next_payment(cid, u)
+        elif action == "sup":
+            _admin_next_ticket(cid, u)
+        elif action == "users":
+            off = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+            _admin_show_users(cid, u, off)
+        elif action == "user" and len(parts) > 2:
+            _admin_show_user(cid, u, int(parts[2]))
+        elif action == "ucredit" and len(parts) > 2:
+            _set_state(u["id"], "admin_user_credit", {"uid": int(parts[2])})
+            bot.send_message(cid, _t("admin_ask_credits", u["id"]),
+                             reply_markup=types.ForceReply(selective=False))
+        elif action == "uplan" and len(parts) > 2:
+            _admin_grant_menu(cid, u, int(parts[2]))
+        elif action == "ugrant" and len(parts) > 3:
+            target_uid, key = int(parts[2]), parts[3]
+            expires = _grant_subscription(target_uid, key)
+            until = expires.strftime("%Y-%m-%d") if hasattr(expires, "strftime") else str(expires)
+            tgt = _user_by_id(target_uid)
+            if tgt and tgt.get("tg_chat_id"):
+                p = _get_plan(key) or {}
+                try:
+                    bot.send_message(int(tgt["tg_chat_id"]),
+                                     _t("pay_approved", target_uid, plan=_plan_label(key, target_uid),
+                                        until=until, credits=p.get("credits", 0)), parse_mode="HTML")
+                except Exception:
+                    pass
+            bot.send_message(cid, _t("admin_grant_done", u["id"], until=until))
+            _admin_show_user(cid, u, target_uid)
+        elif action == "udel" and len(parts) > 2:
+            target_uid = int(parts[2])
+            kb = types.InlineKeyboardMarkup()
+            kb.row(types.InlineKeyboardButton(_t("btn_confirm_del", u["id"]), callback_data=f"adm:udelok:{target_uid}"))
+            kb.row(types.InlineKeyboardButton(_t("btn_back", u["id"]), callback_data=f"adm:user:{target_uid}"))
+            bot.send_message(cid, _t("admin_user_view", u["id"],
+                                     username="?", uid=target_uid, role="", left="", max=""), reply_markup=kb)
+        elif action == "udelok" and len(parts) > 2:
+            target_uid = int(parts[2])
+            if target_uid != u["id"]:
+                _delete_user(target_uid)
+            bot.send_message(cid, _t("admin_user_deleted", u["id"]))
+            _admin_show_users(cid, u, 0)
+        elif action == "plans":
+            _admin_show_plans(cid, u)
+        elif action == "plan" and len(parts) > 2:
+            _admin_show_plan(cid, u, parts[2])
+        elif action == "ptoggle" and len(parts) > 2:
+            p = _get_plan(parts[2])
+            if p:
+                _update_plan(parts[2], active=0 if p.get("active", 1) else 1)
+            _admin_show_plan(cid, u, parts[2])
+        elif action == "pedit" and len(parts) > 3:
+            key, field = parts[2], parts[3]
+            _set_state(u["id"], "admin_plan_edit", {"key": key, "field": field})
+            bot.send_message(cid, _t("admin_ask_value", u["id"], field=field),
+                             parse_mode="HTML", reply_markup=types.ForceReply(selective=False))
+        elif action == "padd":
+            _set_state(u["id"], "admin_plan_new", {})
+            bot.send_message(cid, _t("admin_ask_newkey", u["id"]),
+                             reply_markup=types.ForceReply(selective=False))
+
+    # ── Universal "🏠 Main menu" — clears any state, never a dead end ────────
+    @bot.callback_query_handler(func=lambda c: c.data == "home")
+    def h_home_cb(c):
+        bot.answer_callback_query(c.id)
+        u = _user_by_chat(c.message.chat.id)
+        if not u:
+            return
+        _clear_state(u["id"])
+        bot.send_message(c.message.chat.id, _t("main_menu", u["id"]), reply_markup=_main_menu_kb(u["id"]))
+
 
     @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("job:"))
     def h_job_view_cb(c):
@@ -1459,11 +1894,44 @@ def _register_handlers():
             )
             bot.send_message(c.message.chat.id, _t("choose_os", u["id"]), reply_markup=kb)
         elif action == "proxy":
-            _set_state(u["id"], "proxy", {})
-            bot.send_message(
-                c.message.chat.id, _t("proxy_prompt", u["id"]),
-                reply_markup=types.ForceReply(selective=False),
+            # Start the multi-step proxy wizard with a scheme picker.
+            kb = types.InlineKeyboardMarkup()
+            kb.row(
+                types.InlineKeyboardButton("HTTP", callback_data="pxs:http"),
+                types.InlineKeyboardButton("SOCKS5", callback_data="pxs:socks5"),
             )
+            kb.row(types.InlineKeyboardButton(_t("btn_cancel", u["id"]), callback_data="home"))
+            bot.send_message(c.message.chat.id, _t("proxy_scheme", u["id"]),
+                             parse_mode="HTML", reply_markup=kb)
+
+    # ── Proxy wizard callbacks: scheme picker + auth yes/no ──────────────────
+    @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("pxs:"))
+    def h_proxy_scheme_cb(c):
+        bot.answer_callback_query(c.id)
+        u = _user_by_chat(c.message.chat.id)
+        if not u:
+            return
+        scheme = c.data.split(":", 1)[1]
+        if scheme not in ("http", "socks5"):
+            return
+        _set_state(u["id"], "proxy_host", {"scheme": scheme})
+        bot.send_message(c.message.chat.id, _t("proxy_ask_host", u["id"]),
+                         parse_mode="HTML", reply_markup=types.ForceReply(selective=False))
+
+    @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("pxauth:"))
+    def h_proxy_auth_cb(c):
+        bot.answer_callback_query(c.id)
+        u = _user_by_chat(c.message.chat.id)
+        if not u:
+            return
+        step, data = _get_state(u["id"])
+        choice = c.data.split(":", 1)[1]
+        if choice == "yes":
+            _set_state(u["id"], "proxy_user", data)
+            bot.send_message(c.message.chat.id, _t("proxy_ask_user", u["id"]),
+                             parse_mode="HTML", reply_markup=types.ForceReply(selective=False))
+        else:
+            _finish_proxy(c.message.chat.id, u, data)
 
     @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("os:"))
     def h_os_cb(c):
@@ -1742,17 +2210,43 @@ def _register_handlers():
                 _clear_state(u["id"])
                 bot.reply_to(m, _t("device_saved", u["id"]))
 
-            elif step == "proxy":
-                if text:
-                    _save_env(u["id"], proxy=text)
-                    msg = _t("proxy_saved", u["id"])
-                else:
-                    env_now = _get_env(u["id"])
-                    env_now.pop("proxy", None)
-                    _ud_set(u["id"], "tg_env", json.dumps(env_now))
-                    msg = _t("proxy_cleared", u["id"])
-                _clear_state(u["id"])
-                bot.reply_to(m, msg)
+            elif step == "proxy_host":
+                if not text:
+                    bot.reply_to(m, _t("proxy_ask_host", u["id"]), parse_mode="HTML",
+                                 reply_markup=types.ForceReply(selective=False))
+                    return
+                data["host"] = text
+                _set_state(u["id"], "proxy_port", data)
+                bot.reply_to(m, _t("proxy_ask_port", u["id"]), parse_mode="HTML",
+                             reply_markup=types.ForceReply(selective=False))
+
+            elif step == "proxy_port":
+                if not text.isdigit():
+                    bot.reply_to(m, _t("proxy_ask_port", u["id"]), parse_mode="HTML",
+                                 reply_markup=types.ForceReply(selective=False))
+                    return
+                data["port"] = text
+                _set_state(u["id"], "proxy_auth", data)   # holding state; resolved by pxauth callback
+                kb = types.InlineKeyboardMarkup()
+                kb.row(
+                    types.InlineKeyboardButton(_t("btn_yes", u["id"]), callback_data="pxauth:yes"),
+                    types.InlineKeyboardButton(_t("btn_no", u["id"]),  callback_data="pxauth:no"),
+                )
+                bot.reply_to(m, _t("proxy_ask_auth", u["id"]), parse_mode="HTML", reply_markup=kb)
+
+            elif step == "proxy_user":
+                if not text:
+                    bot.reply_to(m, _t("proxy_ask_user", u["id"]), parse_mode="HTML",
+                                 reply_markup=types.ForceReply(selective=False))
+                    return
+                data["user"] = text
+                _set_state(u["id"], "proxy_pass", data)
+                bot.reply_to(m, _t("proxy_ask_pass", u["id"]), parse_mode="HTML",
+                             reply_markup=types.ForceReply(selective=False))
+
+            elif step == "proxy_pass":
+                data["pass"] = text
+                _finish_proxy(m.chat.id, u, data)
 
             # ── جمع بيانات الجهاز لكل مهمة (عزل البيانات) ────────────────────
             elif step in ("task_gaid", "task_idfa"):
@@ -1818,12 +2312,44 @@ def _register_handlers():
 
             elif step == "support_msg":
                 _clear_state(u["id"])
-                for cid in _admin_chat_ids():
-                    try:
-                        bot.send_message(int(cid), _t("support_from", 0, user=u["username"], id=u["id"], text=text))
-                    except Exception:
-                        pass
+                _create_ticket(u["id"], text)        # silent inbox; admin reads via /admin
                 bot.reply_to(m, _t("support_sent", u["id"]))
+
+            # ── Admin-only text steps (guarded by role) ─────────────────────
+            elif step == "admin_user_credit" and u["role"] == "admin":
+                _clear_state(u["id"])
+                try:
+                    n = int(text)
+                except ValueError:
+                    bot.reply_to(m, _t("admin_bad_number", u["id"]))
+                else:
+                    _admin_add_credits(data.get("uid"), n)
+                    bot.reply_to(m, _t("admin_credits_done", u["id"]))
+                    _admin_show_user(m.chat.id, u, data.get("uid"))
+
+            elif step == "admin_plan_edit" and u["role"] == "admin":
+                _clear_state(u["id"])
+                key, field = data.get("key"), data.get("field")
+                if field in ("credits", "days"):
+                    if not text.lstrip("-").isdigit():
+                        bot.reply_to(m, _t("admin_bad_number", u["id"]))
+                        _admin_show_plan(m.chat.id, u, key)
+                        return
+                    _update_plan(key, **{field: int(text)})
+                else:                                  # price / label_en / label_ar / label_bn
+                    _update_plan(key, **{field: text})
+                bot.reply_to(m, _t("admin_plan_saved", u["id"]))
+                _admin_show_plan(m.chat.id, u, key)
+
+            elif step == "admin_plan_new" and u["role"] == "admin":
+                _clear_state(u["id"])
+                key = re.sub(r"[^A-Za-z0-9]", "", text)[:16]
+                if not key:
+                    bot.reply_to(m, _t("admin_ask_newkey", u["id"]))
+                    return
+                _create_plan(key)
+                bot.reply_to(m, _t("admin_plan_created", u["id"]))
+                _admin_show_plan(m.chat.id, u, key)
 
             else:
                 # foolproof: unknown state → reset and return to the main menu
@@ -1861,6 +2387,17 @@ if bot:
 # ═══════════════════════════════════════════════════════════════════════════════
 # تكامل Flask (Webhook)
 # ═══════════════════════════════════════════════════════════════════════════════
+_UPDATE_POOL = ThreadPoolExecutor(max_workers=12, thread_name_prefix="tg-update")
+
+
+def _process_update_safe(update) -> None:
+    """Runs the full handler chain off the webhook thread; logs but never raises."""
+    try:
+        bot.process_new_updates([update])
+    except Exception as e:
+        logger.error(f"[Telegram] update processing failed: {e}")
+
+
 def register_webhook(app) -> None:
     if not bot:
         logger.info("[Telegram] webhook route not added (bot disabled).")
@@ -1875,7 +2412,10 @@ def register_webhook(app) -> None:
                 return ("forbidden", 403)
         if request.headers.get("content-type", "").startswith("application/json"):
             update = types.Update.de_json(request.get_data().decode("utf-8"))
-            bot.process_new_updates([update])
+            # LATENCY FIX: do NOT process inline. Hand the update to a worker
+            # thread and return 200 immediately (~1ms) so Telegram's spinner
+            # clears at once; all DB/API work happens off the request thread.
+            _UPDATE_POOL.submit(_process_update_safe, update)
             return ("", 200)
         return ("bad request", 400)
 
@@ -1883,12 +2423,42 @@ def register_webhook(app) -> None:
     logger.info(f"[Telegram] webhook route registered: {path}")
 
 
+_BOT_COMMANDS = [
+    ("start",    "cmd_start"),
+    ("apps",     "cmd_apps"),
+    ("jobs",     "cmd_jobs"),
+    ("balance",  "cmd_balance"),
+    ("services", "cmd_services"),
+    ("profile",  "cmd_profile"),
+    ("help",     "cmd_help"),
+]
+
+
+def _setup_commands() -> None:
+    """Registers the persistent command menu (the 'Menu' button) per language."""
+    if not bot:
+        return
+    try:
+        default_cmds = [types.BotCommand(c, locales.lookup(key, locales.DEFAULT_LANG))
+                        for c, key in _BOT_COMMANDS]
+        bot.set_my_commands(default_cmds)                       # default scope (all users)
+        for lang in locales.SUPPORTED:
+            if lang == locales.DEFAULT_LANG:
+                continue
+            cmds = [types.BotCommand(c, locales.lookup(key, lang)) for c, key in _BOT_COMMANDS]
+            bot.set_my_commands(cmds, language_code=lang)       # per-language descriptions
+        logger.info("[Telegram] bot command menu configured")
+    except Exception as e:
+        logger.warning(f"[Telegram] set_my_commands failed: {e}")
+
+
 def maybe_setup_webhook() -> None:
     if not bot:
         return
+    _setup_commands()                       # persistent Menu button — set regardless of webhook
     base = config.PUBLIC_BASE_URL
     if not base:
-        logger.info("[Telegram] PUBLIC_BASE_URL غير مضبوط — استخدم scripts/set_webhook.py")
+        logger.info("[Telegram] PUBLIC_BASE_URL not set — use scripts/set_webhook.py")
         return
     secret = config.TELEGRAM_WEBHOOK_SECRET or "hook"
     url = f"{base.rstrip('/')}/telegram/webhook/{secret}"
