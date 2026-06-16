@@ -748,14 +748,14 @@ def _schedule_test(user, idx, value, minutes, env=None):
             with conn.cursor() as cur:
                 cur.execute(
                     """INSERT INTO scheduled_jobs
-                         (user_id, name, events, package, dev_key, gaid, afid,
+                         (user_id, name, events, package, dev_key, gaid, afid, os,
                           proxy_host, proxy_port, proxy_user, proxy_pass,
                           run_at, enabled)
-                       VALUES (%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,
+                       VALUES (%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                                NOW() + make_interval(mins => %s), 1)
                        RETURNING run_at""",
                     (user["id"], name, events, app_cfg["package"], dev_key,
-                     device_id, env.get("afid", ""),
+                     device_id, env.get("afid", ""), os_,
                      p_host, p_port, p_user, p_pass, minutes),
                 )
                 run_at = cur.fetchone()["run_at"]
@@ -929,12 +929,12 @@ def _save_add_job(user, data):
             with conn.cursor() as cur:
                 cur.execute(
                     """INSERT INTO scheduled_jobs
-                         (user_id, name, events, package, dev_key, gaid, afid,
+                         (user_id, name, events, package, dev_key, gaid, afid, os,
                           proxy_host, proxy_port, proxy_user, proxy_pass, run_at, enabled)
-                       VALUES (%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s, NOW(), 1)
+                       VALUES (%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s, NOW(), 1)
                        RETURNING id""",
                     (user["id"], data["name"], events, data["package"], data["dev_key"],
-                     device_id, env.get("afid", ""), p_host, p_port, p_user, p_pass),
+                     device_id, env.get("afid", ""), os_, p_host, p_port, p_user, p_pass),
                 )
                 return cur.fetchone()["id"]
     except Exception as e:
