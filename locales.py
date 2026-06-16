@@ -10,7 +10,7 @@ locales.py — طبقة الترجمة (i18n)
 """
 
 DEFAULT_LANG = "ar"
-SUPPORTED = ("ar", "en")
+SUPPORTED = ("ar", "en", "bn")
 
 LOCALES = {
     "ar": {
