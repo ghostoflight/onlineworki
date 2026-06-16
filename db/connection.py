@@ -37,17 +37,6 @@ def get_pool() -> pool.ThreadedConnectionPool:
                     maxconn=12,
                     dsn=config.DATABASE_URL,
                     cursor_factory=extras.RealDictCursor,
-                    # FIX 1 — TCP Keepalives (Silent Drop Fix):
-                    # Supabase's PgBouncer forcefully drops idle connections after ~5 min.
-                    # These socket-level keepalives probe the connection every 30 s of
-                    # inactivity, retrying up to 5 times at 10 s intervals, so the OS
-                    # detects and evicts dead sockets before psycopg2 tries to reuse them.
-                    # This eliminates the 3-5 s TCP-timeout stall on the first query after
-                    # an idle period.
-                    keepalives=1,
-                    keepalives_idle=30,
-                    keepalives_interval=10,
-                    keepalives_count=5,
                 )
                 logger.info("[DB] Connection pool initialized.")
     return _pool
@@ -181,13 +170,6 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_jobs_run_at      ON scheduled_jobs(run_at) WHERE enabled = 1;
         CREATE INDEX IF NOT EXISTS idx_history_user     ON event_history(user_id);
         CREATE INDEX IF NOT EXISTS idx_job_logs_job     ON job_logs(job_id);
-
-        -- FIX 2 — Missing Index (Sequential Scan Fix):
-        -- Every Telegram update triggers _user_by_chat(chat_id), which queries
-        -- users WHERE tg_chat_id = %s. Without this index Postgres does a full
-        -- sequential scan of the users table on every single webhook call.
-        -- This B-tree index reduces that lookup from O(n) to O(log n).
-        CREATE INDEX IF NOT EXISTS idx_users_tg_chat_id ON users(tg_chat_id);
     """
 
     with get_conn() as conn:
