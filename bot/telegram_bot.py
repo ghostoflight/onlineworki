@@ -27,14 +27,6 @@ from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from datetime import datetime, timezone
 
-# PERF FIX: Railway/Docker containers often hang ~3 s resolving IPv6 for
-# api.telegram.org before falling back to IPv4. Force urllib3 (which
-# pyTelegramBotAPI relies on) to only ever request AF_INET addresses,
-# eliminating that DNS round-trip penalty on every outbound API call.
-import socket
-import urllib3.util.connection as _urllib3_conn
-_urllib3_conn.allowed_gai_family = lambda: socket.AF_INET
-
 import requests
 import psycopg2
 import telebot
