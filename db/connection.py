@@ -1,11 +1,11 @@
 """
-db/connection.py — طبقة الاتصال بـ PostgreSQL (Supabase)
+db/connection.py — PostgreSQL (Supabase) connection layer.
 
-نستخدم psycopg2 مع ConnectionPool لتجنب استنفاد الـ connections
-في Railway عند تشغيل workers متعددين.
-
-إصلاح هذه النسخة: تهيئة الـ pool آمنة ضد التزامن (double-checked locking)
-حتى لا يُنشَأ أكثر من pool عند أول طلبين متزامنين.
+Thread-safe by design: a single ThreadedConnectionPool is shared across the
+Flask web workers, the Celery workers, AND the background threads that
+telegram_bot.py now spawns for outbound API calls. Every borrow/return goes
+through get_conn(), which guarantees the connection is committed/rolled-back
+and returned to the pool even on error — no leaks across threads.
 """
 import contextlib
 import logging
@@ -19,13 +19,15 @@ import config
 
 logger = logging.getLogger(__name__)
 
-# ─── Connection Pool ─────────────────────────────────────────────────────────
+# minconn=2  : two always-warm (web + worker)
+# maxconn=60 : ceiling for concurrent borrowers (gunicorn workers × threads +
+#              celery concurrency). Keep ≤ your Supabase pooler limit.
 _pool: pool.ThreadedConnectionPool | None = None
 _pool_lock = threading.Lock()
 
 
 def get_pool() -> pool.ThreadedConnectionPool:
-    """يُنشئ الـ pool مرة واحدة فقط ويعيده (Singleton آمن ضد التزامن)."""
+    """Create the pool once and return it (thread-safe singleton, double-checked)."""
     global _pool
     if _pool is None or _pool.closed:
         with _pool_lock:
@@ -42,21 +44,50 @@ def get_pool() -> pool.ThreadedConnectionPool:
 
 @contextlib.contextmanager
 def get_conn() -> Generator:
-    """Context manager يُعيد connection من الـ pool ويُعيده تلقائياً عند الانتهاء."""
+    """
+    Borrow a connection from the pool and return it automatically.
+
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT ...")
+
+    Behaviour:
+      • commits on clean exit, rolls back on exception (then re-raises);
+      • ALWAYS returns the connection to the pool (finally);
+      • a connection that died (conn.closed != 0) is discarded instead of being
+        handed back to the pool — this prevents a broken socket from poisoning
+        another thread/worker that borrows it next.
+    """
     p = get_pool()
-    conn = p.getconn()
+    conn = p.getconn()                     # raises if pool is exhausted (caller handles)
     try:
         yield conn
         conn.commit()
     except Exception:
-        conn.rollback()
+        try:
+            conn.rollback()
+        except Exception:
+            pass                           # connection already gone; discarded below
         raise
     finally:
-        p.putconn(conn)
+        broken = bool(getattr(conn, "closed", 0))
+        try:
+            p.putconn(conn, close=broken)  # close=True ⇒ drop dead connection
+        except Exception as e:
+            logger.warning(f"[DB] putconn failed (discarding): {e}")
+
+
+def close_all() -> None:
+    """Close every pooled connection (use on graceful shutdown)."""
+    global _pool
+    with _pool_lock:
+        if _pool is not None and not _pool.closed:
+            _pool.closeall()
+            logger.info("[DB] Connection pool closed.")
 
 
 def init_db() -> None:
-    """يُنشئ الجداول إن لم تكن موجودة. يُستدعى مرة واحدة عند بدء تشغيل الـ web service."""
+    """Create tables if absent. Called once at web-service startup."""
     schema = """
         CREATE TABLE IF NOT EXISTS users (
             id         SERIAL PRIMARY KEY,
@@ -109,7 +140,7 @@ def init_db() -> None:
             created     TIMESTAMPTZ DEFAULT NOW()
         );
 
-        -- توافق رجعي: إضافة العمود للجداول الموجودة مسبقاً دون فقدان بيانات
+        -- backward-compat: add the column on pre-existing tables without data loss
         ALTER TABLE scheduled_jobs ADD COLUMN IF NOT EXISTS os TEXT DEFAULT '';
 
         CREATE TABLE IF NOT EXISTS job_logs (
