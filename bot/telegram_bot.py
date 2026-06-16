@@ -34,6 +34,7 @@ from flask import request
 import config
 from db.connection import get_conn
 from tasks.job_tasks import execute_job, _build_proxies, _log_event_history
+import locales
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,9 @@ else:
 FREE_USES = 5
 # خطوات تتطلّب إدخالاً نصّياً (تُلتقط بمعالج النص)
 TEXT_STEPS = {"device_gaid", "device_idfa", "device_afid", "proxy", "sniper_value", "custom_input",
-              "add_name", "add_package", "add_devkey", "add_events"}
+              "task_gaid", "task_idfa", "task_afid",
+              "add_name", "add_package", "add_devkey", "add_events",
+              "edit_value", "support_msg"}
 
 
 def _default_dev_key() -> str:
@@ -67,6 +70,13 @@ def _user_by_chat(chat_id) -> dict | None:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM users WHERE tg_chat_id = %s AND active = 1", (str(chat_id),))
+            return cur.fetchone()
+
+
+def _user_by_id(user_id) -> dict | None:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
             return cur.fetchone()
 
 
@@ -192,6 +202,201 @@ def _set_notify(user_id, enabled: bool):
     _ud_set(user_id, "notify_enabled", "1" if enabled else "0")
 
 
+# ── i18n: لغة المستخدم محفوظة في user_data (مفتاح lang) ──────────────────────
+def _lang(user_id) -> str:
+    code = _ud_get(user_id, "lang")
+    return code if code in locales.SUPPORTED else locales.DEFAULT_LANG
+
+
+def _set_lang(user_id, code):
+    if code in locales.SUPPORTED:
+        _ud_set(user_id, "lang", code)
+
+
+def _t(key, user_id, **kwargs):
+    """t(key, user_id): يجلب الرسالة حسب لغة المستخدم من قاعدة البيانات."""
+    return locales.lookup(key, _lang(user_id), **kwargs)
+
+
+# ── تنقّل «رجوع»: مكدّس خطوات داخل tg_state (يحفظ الجلسة) ────────────────────
+def _nav_push(user_id, step, data=None):
+    """ينتقل لخطوة جديدة مع حفظ الخطوة الحالية في مكدّس التاريخ للرجوع."""
+    cur_step, cur_data = _get_state(user_id)
+    hist = (cur_data or {}).get("__hist", []) if cur_data else []
+    new_data = dict(data or {})
+    if cur_step:
+        # خزّن لقطة الخطوة السابقة (بدون مكدّسها لتفادي التضخّم)
+        snap = {k: v for k, v in (cur_data or {}).items() if k != "__hist"}
+        hist = hist + [{"step": cur_step, "data": snap}]
+    new_data["__hist"] = hist
+    _set_state(user_id, step, new_data)
+
+
+def _nav_back(user_id):
+    """يرجع لخطوة سابقة من المكدّس. يعيد (step, data) أو (None, {}) إن فرغ."""
+    _, data = _get_state(user_id)
+    hist = (data or {}).get("__hist", [])
+    if not hist:
+        return None, {}
+    prev = hist[-1]
+    prev_data = dict(prev.get("data", {}))
+    prev_data["__hist"] = hist[:-1]
+    _set_state(user_id, prev["step"], prev_data)
+    return prev["step"], prev_data
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# الاشتراكات والمدفوعات (جداول جديدة) — المطلبان 7 و8
+# ═══════════════════════════════════════════════════════════════════════════════
+PLANS = {
+    "w": {"days": 7,  "credits": 50,  "label_ar": "أسبوعي", "label_en": "Weekly"},
+    "m": {"days": 30, "credits": 200, "label_ar": "شهري",   "label_en": "Monthly"},
+}
+
+_tables_ready = False
+
+
+def _ensure_tables():
+    """ينشئ جدولَي subscriptions و payments إن لم يوجدا (idempotent)."""
+    global _tables_ready
+    if _tables_ready:
+        return
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS subscriptions (
+                        id          SERIAL PRIMARY KEY,
+                        user_id     INTEGER NOT NULL,
+                        plan        TEXT,
+                        status      TEXT DEFAULT 'active',
+                        expires_at  TIMESTAMPTZ,
+                        created_at  TIMESTAMPTZ DEFAULT NOW()
+                    )""")
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS payments (
+                        id           SERIAL PRIMARY KEY,
+                        user_id      INTEGER NOT NULL,
+                        plan         TEXT,
+                        screenshot   TEXT,
+                        status       TEXT DEFAULT 'pending',
+                        created_at   TIMESTAMPTZ DEFAULT NOW(),
+                        reviewed_at  TIMESTAMPTZ
+                    )""")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_sub_user ON subscriptions(user_id)")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_pay_status ON payments(status)")
+        _tables_ready = True
+    except Exception as e:
+        logger.warning(f"[Telegram] ensure tables failed: {e}")
+
+
+def _plan_label(plan_key, uid=None):
+    p = PLANS.get(plan_key)
+    if not p:
+        return plan_key
+    return p["label_en"] if (uid and _lang(uid) == "en") else p["label_ar"]
+
+
+def _has_active_subscription(user_id) -> bool:
+    _ensure_tables()
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM subscriptions WHERE user_id=%s AND status='active' AND expires_at > NOW() LIMIT 1",
+                    (user_id,),
+                )
+                return cur.fetchone() is not None
+    except Exception as e:
+        logger.warning(f"[Telegram] sub check failed: {e}")
+        return False
+
+
+def _sub_expiry(user_id):
+    """يعيد أحدث تاريخ انتهاء فعّال أو None."""
+    _ensure_tables()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT expires_at FROM subscriptions
+                   WHERE user_id=%s AND status='active' AND expires_at > NOW()
+                   ORDER BY expires_at DESC LIMIT 1""",
+                (user_id,),
+            )
+            row = cur.fetchone()
+    return row["expires_at"] if row else None
+
+
+def _create_payment(user_id, plan_key, screenshot_file_id) -> int | None:
+    _ensure_tables()
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO payments (user_id, plan, screenshot, status) VALUES (%s,%s,%s,'pending') RETURNING id",
+                    (user_id, plan_key, screenshot_file_id),
+                )
+                return cur.fetchone()["id"]
+    except Exception as e:
+        logger.error(f"[Telegram] create payment failed: {e}")
+        return None
+
+
+def _get_payment(payment_id):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM payments WHERE id=%s", (payment_id,))
+            return cur.fetchone()
+
+
+def _list_pending_payments(limit=10):
+    _ensure_tables()
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM payments WHERE status='pending' ORDER BY id ASC LIMIT %s", (limit,)
+            )
+            return cur.fetchall()
+
+
+def _grant_subscription(user_id, plan_key):
+    """يفعّل اشتراكاً ويضيف الرصيد (يُستدعى عند قبول الدفع)."""
+    p = PLANS.get(plan_key)
+    if not p:
+        return None
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO subscriptions (user_id, plan, status, expires_at)
+                   VALUES (%s,%s,'active', NOW() + make_interval(days => %s))
+                   RETURNING expires_at""",
+                (user_id, plan_key, p["days"]),
+            )
+            expires = cur.fetchone()["expires_at"]
+            cur.execute(
+                "UPDATE users SET uses_left = uses_left + %s, max_uses = max_uses + %s WHERE id=%s",
+                (p["credits"], p["credits"], user_id),
+            )
+    return expires
+
+
+def _set_payment_status(payment_id, status):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE payments SET status=%s, reviewed_at=NOW() WHERE id=%s AND status='pending' RETURNING user_id, plan",
+                (status, payment_id),
+            )
+            return cur.fetchone()
+
+
+def _admin_chat_ids():
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT tg_chat_id FROM users WHERE role='admin' AND tg_chat_id IS NOT NULL")
+            return [r["tg_chat_id"] for r in cur.fetchall()]
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # الرصيد
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -314,24 +519,31 @@ def _dispatch_event(app_cfg, value, user, env):
         return False, str(e)[:80], True
 
 
-def _do_execute_now(chat_id, user, idx, value):
+def _do_execute_now(chat_id, user, idx, value, env=None):
     if idx < 0 or idx >= len(GAMES_DATA):
         bot.send_message(chat_id, "انتهت الجلسة. أعد /apps.")
         return
     app_cfg = GAMES_DATA[idx]
-    env = _get_env(user["id"])
+    if env is None:                       # عزل البيانات: env قد يأتي من المهمة مباشرة
+        env = _get_env(user["id"])
     # بوابة الصدّ: تحقّق قبل خصم الرصيد
     missing = _missing_requirements(app_cfg, env)
     if missing:
         bot.send_message(chat_id, _requirements_message(missing))
         return
-    ok_bal, left = _consume_use(user)
-    if not ok_bal:
-        bot.send_message(chat_id, "🚫 عذراً، نفد رصيدك.")
-        return
+    # بوابة الرصيد/الاشتراك: الاشتراك الفعّال يتجاوز خصم الرصيد
+    consumed = False
+    if _has_active_subscription(user["id"]):
+        left = user["uses_left"]
+    else:
+        ok_bal, left = _consume_use(user)
+        if not ok_bal:
+            bot.send_message(chat_id, _t("no_credits", user["id"]))
+            return
+        consumed = True
     bot.send_chat_action(chat_id, "typing")
     ok, info, transport_err = _dispatch_event(app_cfg, value, user, env)
-    if not ok and transport_err:
+    if not ok and transport_err and consumed:
         _refund_use(user)
         left += 1
     if ok:
@@ -374,42 +586,153 @@ def _parse_custom(text):
     return (event, minutes) if minutes else None
 
 
-def _send_mode_menu(chat_id, app_cfg):
-    """قائمة اختيار وضع التنفيذ (HTML bubble) — 🎯 القناص / ✍️ المخصّص."""
+def _send_mode_menu(chat_id, app_cfg, uid=None):
+    """قائمة اختيار وضع التنفيذ (HTML bubble) — 🎯 القناص / ✍️ المخصّص + رجوع."""
     text = (
         f"🧪 <b>{html.escape(app_cfg['name'])}</b>\n\n"
         "اختر <b>وضع التنفيذ</b>:\n\n"
         "🎯 <b>القناص</b> — حدث واحد فوري (مثل <code>Level 50</code>)\n"
         "✍️ <b>المخصّص</b> — جدولة بصيغة <code>Event | Hours</code> (مثل <code>Purchase | 24</code>)"
     )
+    back = _t("btn_back", uid) if uid else "🔙 رجوع"
+    cancel = _t("btn_cancel", uid) if uid else "❌ إلغاء"
     kb = types.InlineKeyboardMarkup()
     kb.row(
         types.InlineKeyboardButton("🎯 القناص", callback_data="mode:sniper"),
         types.InlineKeyboardButton("✍️ المخصّص", callback_data="mode:custom"),
     )
-    kb.row(types.InlineKeyboardButton("❌ إلغاء", callback_data="mode:cancel"))
+    kb.row(
+        types.InlineKeyboardButton(back, callback_data="nav:back"),
+        types.InlineKeyboardButton(cancel, callback_data="nav:cancel"),
+    )
     bot.send_message(chat_id, text, parse_mode="HTML", reply_markup=kb)
 
 
-def _schedule_test(user, idx, value, minutes):
+# ── الكتالوج المتسلسل (يُحسب من GAMES_DATA — يدعم البنية الجديدة os/cat) ──────
+def _os_list():
+    seen = []
+    for g in GAMES_DATA:
+        o = g.get("os", "android")
+        if o not in seen:
+            seen.append(o)
+    return seen
+
+
+def _cat_list(os_):
+    cats = []
+    for g in GAMES_DATA:
+        if g.get("os") == os_ and g.get("cat") and g["cat"] not in cats:
+            cats.append(g["cat"])
+    return cats
+
+
+def _game_list(os_, cat):
+    return [(i, g) for i, g in enumerate(GAMES_DATA)
+            if g.get("os") == os_ and g.get("cat") == cat]
+
+
+def _env_from_data(data):
+    """عزل البيانات: يبني env المهمة من بيانات الحالة (لا من الملف العام)."""
+    os_ = (data.get("os") or "android").lower()
+    env = {"os": os_, "afid": data.get("afid", "")}
+    if os_ == "ios":
+        env["idfa"] = data.get("idfa", "")
+    else:
+        env["gaid"] = data.get("gaid", "")
+    return env
+
+
+def _nav_row(uid, with_back=True):
+    kb_row = []
+    if with_back:
+        kb_row.append(types.InlineKeyboardButton(_t("btn_back", uid), callback_data="nav:back"))
+    kb_row.append(types.InlineKeyboardButton(_t("btn_cancel", uid), callback_data="nav:cancel"))
+    return kb_row
+
+
+# ── لوحات العرض (نقيّة: لا تغيّر الحالة) ──────────────────────────────────────
+_OS_LABELS = {"android": "🤖 Android", "ios": "🍎 iOS"}
+
+
+def _render_os_ui(chat_id, u):
+    kb = types.InlineKeyboardMarkup()
+    row = [types.InlineKeyboardButton(_OS_LABELS.get(o, o), callback_data=f"nav:os:{o}")
+           for o in _os_list()]
+    if row:
+        kb.row(*row)
+    kb.row(*_nav_row(u["id"], with_back=False))
+    bot.send_message(chat_id, _t("choose_os", u["id"]), reply_markup=kb)
+
+
+def _render_categories_ui(chat_id, u, os_):
+    cats = _cat_list(os_)
+    kb = types.InlineKeyboardMarkup()
+    for ci, cat in enumerate(cats):
+        kb.row(types.InlineKeyboardButton(cat, callback_data=f"nav:cat:{ci}"))
+    kb.row(*_nav_row(u["id"]))
+    bot.send_message(chat_id, _t("choose_category", u["id"]), reply_markup=kb)
+
+
+def _render_games_ui(chat_id, u, os_, cat):
+    games = _game_list(os_, cat)
+    if not games:
+        bot.send_message(chat_id, _t("no_games", u["id"]))
+        return
+    kb = types.InlineKeyboardMarkup()
+    for ai, g in games:
+        kb.row(types.InlineKeyboardButton(g["name"], callback_data=f"nav:game:{ai}"))
+    kb.row(*_nav_row(u["id"]))
+    bot.send_message(chat_id, _t("choose_game", u["id"]), reply_markup=kb)
+
+
+_DEVICE_PROMPT = {"task_gaid": "ask_gaid", "task_idfa": "ask_idfa", "task_afid": "ask_afid"}
+
+
+def _ask_device(chat_id, u, step):
+    kb = types.InlineKeyboardMarkup()
+    kb.row(*_nav_row(u["id"]))
+    bot.send_message(chat_id, _t(_DEVICE_PROMPT[step], u["id"]), parse_mode="HTML", reply_markup=kb)
+
+
+def _render_step(chat_id, u, step, data):
+    """يعيد رسم واجهة خطوة معيّنة (يُستخدم مع زر الرجوع)."""
+    if step == "apps_os":
+        _render_os_ui(chat_id, u)
+    elif step == "apps_cat":
+        _render_categories_ui(chat_id, u, data.get("os"))
+    elif step == "apps_game":
+        _render_games_ui(chat_id, u, data.get("os"), data.get("cat"))
+    elif step in ("task_gaid", "task_idfa", "task_afid"):
+        _ask_device(chat_id, u, step)
+    elif step == "awaiting_mode":
+        idx = data.get("app_index", -1)
+        if 0 <= idx < len(GAMES_DATA):
+            _send_mode_menu(chat_id, GAMES_DATA[idx], u["id"])
+
+
+def _schedule_test(user, idx, value, minutes, env=None):
     """
     يجدول اختباراً. يعيد (status, payload):
       ("ok", run_at) | ("invalid", missing_list) | ("balance", None)
       | ("session", None) | ("db", None)
     يتحقّق من الجاهزية قبل خصم الرصيد أو الإدراج (لا تلويث لقاعدة البيانات).
+    env اختياري: بيانات الجهاز الخاصة بالمهمة (عزل البيانات)؛ وإلا من الملف العام.
     """
     if idx < 0 or idx >= len(GAMES_DATA):
         return "session", None
     app_cfg = GAMES_DATA[idx]
-    env = _get_env(user["id"])
+    if env is None:
+        env = _get_env(user["id"])
 
     missing = _missing_requirements(app_cfg, env)
     if missing:
         return "invalid", missing
 
-    ok_bal, _ = _consume_use(user)
-    if not ok_bal:
-        return "balance", None
+    # بوابة الرصيد/الاشتراك: الاشتراك الفعّال يتجاوز خصم الرصيد
+    if not _has_active_subscription(user["id"]):
+        ok_bal, _ = _consume_use(user)
+        if not ok_bal:
+            return "balance", None
 
     # إصلاح منطقي: القيمة الممرّرة (value) هي eventName الصريح، وإلا الافتراضي
     event_name = (value or "").strip() or app_cfg.get("event", "af_level_achieved")
@@ -634,15 +957,8 @@ def _open_apps(chat_id, user):
     if not GAMES_DATA:
         bot.send_message(chat_id, "لا توجد تطبيقات مُعرّفة بعد.")
         return
-    kb = types.InlineKeyboardMarkup()
-    row = []
-    for i, app_cfg in enumerate(GAMES_DATA):
-        row.append(types.InlineKeyboardButton(app_cfg["name"], callback_data=f"app:{i}"))
-        if len(row) == 2:
-            kb.row(*row); row = []
-    if row:
-        kb.row(*row)
-    bot.send_message(chat_id, "اختر التطبيق للاختبار:", reply_markup=kb)
+    _set_state(user["id"], "apps_os", {})   # مدخل التدفّق المتسلسل (بلا تاريخ)
+    _render_os_ui(chat_id, user)
 
 
 def _open_profile(chat_id, user):
@@ -665,28 +981,182 @@ def _open_profile(chat_id, user):
     bot.send_message(chat_id, txt, reply_markup=kb)
 
 
-MAIN_MENU_LABELS = {
-    "➕ مهمة جديدة": "add",
-    "🧪 التطبيقات":  "apps",
-    "👤 حسابي":      "profile",
-    "⚙️ الإعدادات":  "settings",
-    "📊 رصيدي":      "balance",
-}
+_MENU_KEYS = [
+    ("btn_new_task", "add"),
+    ("btn_apps",     "apps"),
+    ("btn_profile",  "profile"),
+    ("btn_settings", "settings"),
+    ("btn_balance",  "balance"),
+    ("btn_services", "services"),
+]
 
 
-def _main_menu_kb():
+def _main_menu_kb(uid):
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row("➕ مهمة جديدة", "🧪 التطبيقات")
-    kb.row("👤 حسابي", "⚙️ الإعدادات")
-    kb.row("📊 رصيدي")
+    kb.row(_t("btn_new_task", uid), _t("btn_apps", uid))
+    kb.row(_t("btn_profile", uid), _t("btn_settings", uid))
+    kb.row(_t("btn_balance", uid), _t("btn_services", uid))
     return kb
+
+
+def _menu_target(text):
+    """يطابق نص الزر بأي لغة مدعومة مع هدفه (يدعم تبديل اللغة)."""
+    for lang in locales.SUPPORTED:
+        for key, target in _MENU_KEYS:
+            if locales.lookup(key, lang) == text:
+                return target
+    return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# مركز الخدمات + المهام (عرض)
+# ═══════════════════════════════════════════════════════════════════════════════
+def _open_services(chat_id, u):
+    kb = types.InlineKeyboardMarkup()
+    kb.row(types.InlineKeyboardButton(_t("btn_subscribe", u["id"]),  callback_data="svc:plans"))
+    kb.row(types.InlineKeyboardButton(_t("btn_sub_status", u["id"]), callback_data="svc:status"))
+    kb.row(types.InlineKeyboardButton(_t("btn_support", u["id"]),    callback_data="svc:support"))
+    bot.send_message(chat_id, _t("services_menu", u["id"]), reply_markup=kb)
+
+
+def _send_plans(chat_id, u):
+    kb = types.InlineKeyboardMarkup()
+    for key, p in PLANS.items():
+        label = f"{_plan_label(key, u['id'])} · {p['credits']}/{p['days']}d"
+        kb.row(types.InlineKeyboardButton(label, callback_data=f"pay:plan:{key}"))
+    kb.row(types.InlineKeyboardButton(_t("btn_cancel", u["id"]), callback_data="svc:close"))
+    bot.send_message(chat_id, _t("choose_plan", u["id"]), reply_markup=kb)
+
+
+def _send_sub_status(chat_id, u):
+    expiry = _sub_expiry(u["id"])
+    fresh = _user_by_chat(chat_id) or u
+    if expiry:
+        until = expiry.strftime("%Y-%m-%d") if hasattr(expiry, "strftime") else str(expiry)
+        bot.send_message(chat_id, _t("sub_active", u["id"], until=until, credits=fresh["uses_left"]), parse_mode="HTML")
+    else:
+        bot.send_message(chat_id, _t("sub_none", u["id"], credits=fresh["uses_left"]))
+
+
+def _notify_admins_payment(payment_id, user, plan_key, screenshot):
+    """يرسل لقطة الدفع لكل مشرف مع أزرار قبول/رفض (مراجعة يدوية)."""
+    caption = (f"💳 طلب دفع #{payment_id}\n"
+               f"مستخدم: {user['username']} (#{user['id']})\n"
+               f"الباقة: {_plan_label(plan_key)}")
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton("✅ قبول", callback_data=f"pay:approve:{payment_id}"),
+        types.InlineKeyboardButton("❌ رفض",  callback_data=f"pay:reject:{payment_id}"),
+    )
+    for cid in _admin_chat_ids():
+        try:
+            bot.send_photo(cid, screenshot, caption=caption, reply_markup=kb)
+        except Exception as e:
+            logger.warning(f"[Telegram] notify admin {cid} failed: {e}")
+
+
+def _user_jobs(user_id, limit=20):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, name, enabled FROM scheduled_jobs WHERE user_id=%s ORDER BY id DESC LIMIT %s",
+                (user_id, limit),
+            )
+            return cur.fetchall()
+
+
+def _job_owned(job_id, user):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM scheduled_jobs WHERE id=%s", (job_id,))
+            job = cur.fetchone()
+    if not job or (job["user_id"] != user["id"] and user["role"] != "admin"):
+        return None
+    return job
+
+
+def _open_jobs(chat_id, u):
+    jobs = _user_jobs(u["id"])
+    if not jobs:
+        bot.send_message(chat_id, _t("jobs_empty", u["id"]))
+        return
+    kb = types.InlineKeyboardMarkup()
+    for j in jobs:
+        mark = "✅" if j["enabled"] else "⏸️"
+        kb.row(types.InlineKeyboardButton(f"{mark} {j['name']}", callback_data=f"job:view:{j['id']}"))
+    bot.send_message(chat_id, _t("jobs_title", u["id"]), reply_markup=kb)
+
+
+def _send_job_detail(chat_id, u, job):
+    import json as _json
+    try:
+        evs = ", ".join(e.get("name", "") for e in (job.get("events") or []))
+    except Exception:
+        evs = str(job.get("events"))
+    txt = (
+        f"📝 <b>{html.escape(job['name'])}</b>\n"
+        f"📦 <code>{html.escape(job.get('package',''))}</code>\n"
+        f"📡 {html.escape(evs)}\n"
+        f"الحالة: {'✅ مفعّلة' if job['enabled'] else '⏸️ موقوفة'}"
+    )
+    kb = types.InlineKeyboardMarkup()
+    kb.row(
+        types.InlineKeyboardButton(_t("btn_run", u["id"]),    callback_data=f"run:{job['id']}"),
+        types.InlineKeyboardButton(_t("btn_toggle", u["id"]), callback_data=f"tog:{job['id']}"),
+    )
+    kb.row(
+        types.InlineKeyboardButton(_t("btn_edit", u["id"]),   callback_data=f"job:edit:{job['id']}"),
+        types.InlineKeyboardButton(_t("btn_delete", u["id"]), callback_data=f"del:{job['id']}"),
+    )
+    bot.send_message(chat_id, txt, parse_mode="HTML", reply_markup=kb)
+
+
+_EDIT_FIELDS = {"name": "btn_f_name", "dev_key": "btn_f_devkey", "events": "btn_f_events"}
+
+
+def _send_edit_menu(chat_id, u, job_id):
+    kb = types.InlineKeyboardMarkup()
+    for field, lbl in _EDIT_FIELDS.items():
+        kb.row(types.InlineKeyboardButton(_t(lbl, u["id"]), callback_data=f"edit:{field}:{job_id}"))
+    bot.send_message(chat_id, _t("edit_menu", u["id"]), reply_markup=kb)
+
+
+def _apply_job_edit(job, field, value):
+    """يحدّث حقلاً واحداً في scheduled_jobs (قائمة بيضاء للأعمدة). يعيد True/False."""
+    import json as _json
+    if field not in _EDIT_FIELDS:
+        return False
+    if field == "events":
+        evs = [e.strip() for e in value.split(",") if e.strip()]
+        if not evs:
+            return False
+        new_val = _json.dumps([{"name": e} for e in evs])
+        col_expr = "events = %s::jsonb"
+    elif field == "name":
+        if not value.strip():
+            return False
+        new_val = value.strip()
+        col_expr = "name = %s"
+    else:  # dev_key
+        if len(value.strip()) < 6:
+            return False
+        new_val = value.strip()
+        col_expr = "dev_key = %s"
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(f"UPDATE scheduled_jobs SET {col_expr} WHERE id=%s", (new_val, job["id"]))
+        return True
+    except Exception as e:
+        logger.error(f"[Telegram] job edit failed: {e}")
+        return False
 
 
 def _register_handlers():
     if not bot:
         return
 
-    # ── /start ───────────────────────────────────────────────────────────────
+    # ── /start — إعادة ضبط شاملة (Factory Reset) + القائمة الرئيسية ──────────
     @bot.message_handler(commands=["start"])
     def h_start(m):
         parts = (m.text or "").split(maxsplit=1)
@@ -696,22 +1166,217 @@ def _register_handlers():
             if uid:
                 _set_chat(uid, m.chat.id)
                 u = _user_by_chat(m.chat.id)
+                _clear_state(u["id"])
                 bot.reply_to(m, f"✅ تم ربط حسابك {u['username']}.\n/apps للبدء.")
                 return
         if u:
+            _clear_state(u["id"])   # إعادة ضبط: مسح كل الحالات المؤقتة
             bot.send_message(
                 m.chat.id,
-                f"مرحباً {u['username']} 👋\nالرصيد: {u['uses_left']}/{u['max_uses']}",
-                reply_markup=_main_menu_kb(),
+                _t("welcome_back", u["id"], name=u["username"], credits=u["uses_left"], max=u["max_uses"]),
+                reply_markup=_main_menu_kb(u["id"]),
             )
             return
         u = _auto_register(m.chat.id, m.from_user.username, m.from_user.first_name)
+        _clear_state(u["id"])
         bot.send_message(
             m.chat.id,
-            f"أهلاً {u['username']} 👋\nتم إنشاء حسابك.\n🎁 رصيدك المجاني: {u['uses_left']} اختبارات.\n\n"
-            f"1) أعدّ جهازك: /profile\n2) ابدأ اختباراً: /apps أو ➕ مهمة جديدة",
-            reply_markup=_main_menu_kb(),
+            _t("welcome", u["id"], name=u["username"], credits=u["uses_left"]),
+            reply_markup=_main_menu_kb(u["id"]),
         )
+
+    # ── /lang — تبديل اللغة ──────────────────────────────────────────────────
+    @bot.message_handler(commands=["lang"])
+    @linked
+    def h_lang(m, u):
+        kb = types.InlineKeyboardMarkup()
+        kb.row(
+            types.InlineKeyboardButton("العربية", callback_data="lang:set:ar"),
+            types.InlineKeyboardButton("English", callback_data="lang:set:en"),
+        )
+        bot.send_message(m.chat.id, _t("lang_choose", u["id"]), reply_markup=kb)
+
+    @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("lang:set:"))
+    def h_lang_cb(c):
+        u = _user_by_chat(c.message.chat.id)
+        if not u:
+            bot.answer_callback_query(c.id)
+            return
+        code = c.data.rsplit(":", 1)[1]
+        _set_lang(u["id"], code)
+        bot.answer_callback_query(c.id)
+        bot.send_message(c.message.chat.id, _t("lang_set", u["id"]), reply_markup=_main_menu_kb(u["id"]))
+
+    # ── /services — مركز الخدمات (المطلب 7) ──────────────────────────────────
+    @bot.message_handler(commands=["services"])
+    @linked
+    def h_services(m, u):
+        _open_services(m.chat.id, u)
+
+    @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("svc:"))
+    def h_svc_cb(c):
+        u = _user_by_chat(c.message.chat.id)
+        if not u:
+            bot.answer_callback_query(c.id)
+            return
+        action = c.data.split(":", 1)[1]
+        bot.answer_callback_query(c.id)
+        if action == "plans":
+            _send_plans(c.message.chat.id, u)
+        elif action == "status":
+            _send_sub_status(c.message.chat.id, u)
+        elif action == "support":
+            _set_state(u["id"], "support_msg", {})
+            bot.send_message(c.message.chat.id, _t("support_prompt", u["id"]),
+                             reply_markup=types.ForceReply(selective=False))
+        elif action == "close":
+            _clear_state(u["id"])
+            bot.send_message(c.message.chat.id, _t("reset_done", u["id"]), reply_markup=_main_menu_kb(u["id"]))
+
+    @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("pay:"))
+    def h_pay_cb(c):
+        u = _user_by_chat(c.message.chat.id)
+        if not u:
+            bot.answer_callback_query(c.id)
+            return
+        parts = c.data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        # اختيار باقة → تعليمات + انتظار لقطة الشاشة
+        if action == "plan" and len(parts) > 2:
+            plan_key = parts[2]
+            p = PLANS.get(plan_key)
+            if not p:
+                bot.answer_callback_query(c.id)
+                return
+            _set_state(u["id"], "pay_screenshot", {"plan": plan_key})
+            bot.answer_callback_query(c.id)
+            bot.send_message(
+                c.message.chat.id,
+                _t("pay_instructions", u["id"], plan=_plan_label(plan_key, u["id"]),
+                   credits=p["credits"], days=p["days"]),
+                parse_mode="HTML",
+            )
+            return
+        # قبول/رفض (للمشرفين فقط)
+        if action in ("approve", "reject") and len(parts) > 2 and u["role"] == "admin":
+            pid = int(parts[2]) if parts[2].isdigit() else 0
+            row = _set_payment_status(pid, "approved" if action == "approve" else "rejected")
+            bot.answer_callback_query(c.id, "تم")
+            if not row:
+                bot.send_message(c.message.chat.id, "الطلب غير موجود أو روجِع مسبقاً.")
+                return
+            target = _user_by_id(row["user_id"])
+            if action == "approve":
+                expires = _grant_subscription(row["user_id"], row["plan"])
+                until = expires.strftime("%Y-%m-%d") if hasattr(expires, "strftime") else str(expires)
+                p = PLANS.get(row["plan"], {})
+                if target and target.get("tg_chat_id"):
+                    bot.send_message(int(target["tg_chat_id"]),
+                                     _t("pay_approved", target["id"], plan=_plan_label(row["plan"], target["id"]),
+                                        until=until, credits=p.get("credits", 0)), parse_mode="HTML")
+                bot.send_message(c.message.chat.id, f"✅ فُعّل اشتراك المستخدم #{row['user_id']} حتى {until}.")
+            else:
+                if target and target.get("tg_chat_id"):
+                    bot.send_message(int(target["tg_chat_id"]), _t("pay_rejected", target["id"]))
+                bot.send_message(c.message.chat.id, f"❌ رُفض طلب #{pid}.")
+            return
+        bot.answer_callback_query(c.id)
+
+    # استقبال لقطة الدفع (صورة) أثناء حالة pay_screenshot
+    @bot.message_handler(content_types=["photo"])
+    def h_payment_photo(m):
+        u = _user_by_chat(m.chat.id)
+        if not u:
+            return
+        step, data = _get_state(u["id"])
+        if step != "pay_screenshot":
+            return
+        plan_key = data.get("plan")
+        file_id = m.photo[-1].file_id
+        _clear_state(u["id"])
+        pid = _create_payment(u["id"], plan_key, file_id)
+        if pid:
+            _notify_admins_payment(pid, u, plan_key, file_id)
+            bot.reply_to(m, _t("pay_received", u["id"]))
+        else:
+            bot.reply_to(m, "تعذّر تسجيل الطلب. حاول لاحقاً.")
+
+    # ── /payments — مراجعة المشرف ────────────────────────────────────────────
+    @bot.message_handler(commands=["payments"])
+    @linked
+    def h_payments(m, u):
+        if u["role"] != "admin":
+            bot.reply_to(m, "هذا الأمر للمشرفين فقط.")
+            return
+        pend = _list_pending_payments()
+        if not pend:
+            bot.reply_to(m, "لا توجد طلبات معلّقة.")
+            return
+        for pay in pend:
+            target = _user_by_id(pay["user_id"])
+            cap = (f"💳 طلب #{pay['id']}\nمستخدم: {target['username'] if target else pay['user_id']}\n"
+                   f"الباقة: {_plan_label(pay['plan'])}")
+            kb = types.InlineKeyboardMarkup()
+            kb.row(
+                types.InlineKeyboardButton("✅ قبول", callback_data=f"pay:approve:{pay['id']}"),
+                types.InlineKeyboardButton("❌ رفض",  callback_data=f"pay:reject:{pay['id']}"),
+            )
+            try:
+                bot.send_photo(m.chat.id, pay["screenshot"], caption=cap, reply_markup=kb)
+            except Exception:
+                bot.send_message(m.chat.id, cap, reply_markup=kb)
+
+    # ── /jobs — قائمة المهام + التحرير (المطلب 8) ────────────────────────────
+    @bot.message_handler(commands=["jobs"])
+    @linked
+    def h_jobs(m, u):
+        _open_jobs(m.chat.id, u)
+
+    @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("job:"))
+    def h_job_view_cb(c):
+        u = _user_by_chat(c.message.chat.id)
+        if not u:
+            bot.answer_callback_query(c.id)
+            return
+        parts = c.data.split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        jid = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+        job = _job_owned(jid, u)
+        bot.answer_callback_query(c.id)
+        if not job:
+            bot.send_message(c.message.chat.id, "غير مصرّح أو المهمة غير موجودة.")
+            return
+        if action == "view":
+            _send_job_detail(c.message.chat.id, u, job)
+        elif action == "edit":
+            _send_edit_menu(c.message.chat.id, u, jid)
+
+    @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("edit:"))
+    def h_edit_cb(c):
+        u = _user_by_chat(c.message.chat.id)
+        if not u:
+            bot.answer_callback_query(c.id)
+            return
+        parts = c.data.split(":")
+        if len(parts) < 3:
+            bot.answer_callback_query(c.id)
+            return
+        field, jid = parts[1], (int(parts[2]) if parts[2].isdigit() else 0)
+        job = _job_owned(jid, u)
+        bot.answer_callback_query(c.id)
+        if not job or field not in _EDIT_FIELDS:
+            return
+        # القيمة الحالية (معبّأة مسبقاً)
+        if field == "events":
+            try:
+                cur = ", ".join(e.get("name", "") for e in (job.get("events") or []))
+            except Exception:
+                cur = ""
+        else:
+            cur = str(job.get(field, ""))
+        _set_state(u["id"], "edit_value", {"job_id": jid, "field": field})
+        bot.send_message(c.message.chat.id, _t("edit_prompt", u["id"], cur=html.escape(cur or "—")),
+                         parse_mode="HTML", reply_markup=types.ForceReply(selective=False))
 
     @bot.message_handler(commands=["help"])
     def h_help(m):
@@ -889,17 +1554,17 @@ def _register_handlers():
             _add_advance(c.message.chat.id, u, value)
             return
 
-    # ── القائمة الرئيسية (ReplyKeyboard) — تربط الأزرار بالأوامر ──────────────
+    # ── القائمة الرئيسية (ReplyKeyboard) — تربط الأزرار بالأوامر (i18n) ───────
     @bot.message_handler(
-        func=lambda m: bool(m.text) and m.text in MAIN_MENU_LABELS and _text_step(m.chat.id) is None,
+        func=lambda m: bool(m.text) and _menu_target(m.text) is not None and _text_step(m.chat.id) is None,
         content_types=["text"],
     )
     def h_menu(m):
         u = _user_by_chat(m.chat.id)
         if not u:
-            bot.reply_to(m, "أرسل /start أولاً.")
+            bot.reply_to(m, locales.lookup("need_start"))
             return
-        target = MAIN_MENU_LABELS[m.text]
+        target = _menu_target(m.text)
         if target == "add":
             _set_state(u["id"], "add_name", {})
             _send_add_step(m.chat.id, "add_name", {})
@@ -911,59 +1576,87 @@ def _register_handlers():
             bot.send_message(m.chat.id, "⚙️ الإعدادات:", reply_markup=_settings_kb(u["id"]))
         elif target == "balance":
             bot.send_message(m.chat.id, f"💳 رصيدك: {u['uses_left']} من {u['max_uses']}")
+        elif target == "services":
+            _open_services(m.chat.id, u)
 
-    @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("app:"))
-    def h_app_pick(c):
+    # ── التدفّق المتسلسل: OS → فئة → تطبيق → جمع بيانات الجهاز ────────────────
+    @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("nav:"))
+    def h_nav_cb(c):
         u = _user_by_chat(c.message.chat.id)
         if not u:
-            bot.answer_callback_query(c.id, "أرسل /start أولاً")
+            bot.answer_callback_query(c.id, _t("need_start", 0))
             return
-        try:
-            idx = int(c.data.split(":", 1)[1])
-        except (ValueError, IndexError):
-            bot.answer_callback_query(c.id, "اختيار غير صالح")
-            return
-        if idx < 0 or idx >= len(GAMES_DATA):
-            bot.answer_callback_query(c.id, "تطبيق غير موجود")
-            return
-        _set_state(u["id"], "awaiting_mode", {"app_index": idx})
         bot.answer_callback_query(c.id)
-        _send_mode_menu(c.message.chat.id, GAMES_DATA[idx])
+        parts = (c.data or "").split(":")
+        action = parts[1] if len(parts) > 1 else ""
+        chat = c.message.chat.id
+
+        if action == "cancel":
+            _clear_state(u["id"])
+            bot.send_message(chat, _t("reset_done", u["id"]), reply_markup=_main_menu_kb(u["id"]))
+            return
+
+        if action == "back":
+            step, data = _nav_back(u["id"])
+            if step is None:
+                _set_state(u["id"], "apps_os", {})
+                _render_os_ui(chat, u)
+            else:
+                _render_step(chat, u, step, data)
+            return
+
+        step, data = _get_state(u["id"])
+        try:
+            if action == "os" and len(parts) > 2:
+                _nav_push(u["id"], "apps_cat", {"os": parts[2]})
+                _render_categories_ui(chat, u, parts[2])
+
+            elif action == "cat" and len(parts) > 2:
+                os_ = data.get("os")
+                cats = _cat_list(os_)
+                ci = int(parts[2])
+                if 0 <= ci < len(cats):
+                    _nav_push(u["id"], "apps_game", {"os": os_, "cat": cats[ci]})
+                    _render_games_ui(chat, u, os_, cats[ci])
+
+            elif action == "game" and len(parts) > 2:
+                ai = int(parts[2])
+                if 0 <= ai < len(GAMES_DATA):
+                    os_ = data.get("os") or GAMES_DATA[ai].get("os", "android")
+                    nxt = "task_idfa" if os_ == "ios" else "task_gaid"
+                    _nav_push(u["id"], nxt, {"os": os_, "cat": data.get("cat"), "app_index": ai})
+                    _ask_device(chat, u, nxt)
+        except (ValueError, IndexError):
+            _clear_state(u["id"])
+            bot.send_message(chat, _t("session_over", u["id"]))
 
     # ── اختيار الوضع: 🎯 القناص (فوري) / ✍️ المخصّص (جدولة) ───────────────────
     @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("mode:"))
     def h_mode_cb(c):
         u = _user_by_chat(c.message.chat.id)
         if not u:
-            bot.answer_callback_query(c.id, "أرسل /start أولاً")
+            bot.answer_callback_query(c.id, _t("need_start", 0))
             return
         action = c.data.split(":", 1)[1]
         if action == "cancel":
             _clear_state(u["id"])
-            bot.answer_callback_query(c.id, "أُلغي")
-            bot.send_message(c.message.chat.id, "❌ أُلغيت العملية.")
+            bot.answer_callback_query(c.id)
+            bot.send_message(c.message.chat.id, _t("reset_done", u["id"]), reply_markup=_main_menu_kb(u["id"]))
             return
         step, data = _get_state(u["id"])
         if step != "awaiting_mode":
-            bot.answer_callback_query(c.id, "انتهت الجلسة")
+            bot.answer_callback_query(c.id, _t("session_over", u["id"]))
             return
         if action == "sniper":
             _set_state(u["id"], "sniper_value", data)
             bot.answer_callback_query(c.id)
-            bot.send_message(
-                c.message.chat.id,
-                "🎯 <b>وضع القناص</b>\nأرسل اسم/قيمة الحدث للتنفيذ الفوري:\n\nمثال: <code>Level 50</code>",
-                parse_mode="HTML", reply_markup=types.ForceReply(selective=False),
-            )
+            bot.send_message(c.message.chat.id, _t("ask_event", u["id"]),
+                             parse_mode="HTML", reply_markup=types.ForceReply(selective=False))
         elif action == "custom":
             _set_state(u["id"], "custom_input", data)
             bot.answer_callback_query(c.id)
-            bot.send_message(
-                c.message.chat.id,
-                "✍️ <b>الوضع المخصّص</b>\nأرسل بصيغة <code>Event | Hours</code>:\n\n"
-                "مثال: <code>Purchase | 24</code>",
-                parse_mode="HTML", reply_markup=types.ForceReply(selective=False),
-            )
+            bot.send_message(c.message.chat.id, _t("ask_delay", u["id"]),
+                             parse_mode="HTML", reply_markup=types.ForceReply(selective=False))
 
     # ── أزرار المهام القديمة ──────────────────────────────────────────────────
     @bot.callback_query_handler(func=lambda c: (c.data or "").split(":")[0] in ("run", "tog", "del"))
@@ -1056,40 +1749,77 @@ def _register_handlers():
                 _clear_state(u["id"])
                 bot.reply_to(m, msg)
 
+            # ── جمع بيانات الجهاز لكل مهمة (عزل البيانات) ────────────────────
+            elif step in ("task_gaid", "task_idfa"):
+                if not text:
+                    _ask_device(m.chat.id, u, step)
+                    return
+                field = "gaid" if step == "task_gaid" else "idfa"
+                fwd = {k: v for k, v in data.items() if k != "__hist"}
+                fwd[field] = text
+                _nav_push(u["id"], "task_afid", fwd)
+                _ask_device(m.chat.id, u, "task_afid")
+
+            elif step == "task_afid":
+                if not text:
+                    _ask_device(m.chat.id, u, step)
+                    return
+                fwd = {k: v for k, v in data.items() if k != "__hist"}
+                fwd["afid"] = text
+                _nav_push(u["id"], "awaiting_mode", fwd)
+                idx = fwd.get("app_index", -1)
+                if 0 <= idx < len(GAMES_DATA):
+                    _send_mode_menu(m.chat.id, GAMES_DATA[idx], u["id"])
+
             elif step == "sniper_value":
-                # 🎯 القناص: تنفيذ فوري لحدث واحد (value يُمرَّر لدالة الإرسال كما هي)
+                # 🎯 القناص: تنفيذ فوري ببيانات الجهاز الخاصة بالمهمة
                 idx = data.get("app_index", -1)
+                env = _env_from_data(data)
                 _clear_state(u["id"])
-                _do_execute_now(m.chat.id, u, idx, text)
+                _do_execute_now(m.chat.id, u, idx, text, env=env)
 
             elif step == "custom_input":
-                # ✍️ المخصّص: "Event | Hours" → جدولة عبر الدالة الحالية
+                # ✍️ المخصّص: "Event | Hours" → جدولة ببيانات المهمة
                 parsed = _parse_custom(text)
                 if not parsed:
-                    bot.reply_to(
-                        m,
-                        "صيغة غير صحيحة. استخدم <code>Event | Hours</code>\nمثال: <code>Purchase | 24</code>",
-                        parse_mode="HTML", reply_markup=types.ForceReply(selective=False),
-                    )
+                    bot.reply_to(m, _t("ask_delay", u["id"]),
+                                 parse_mode="HTML", reply_markup=types.ForceReply(selective=False))
                     return  # نُبقي الحالة لإعادة المحاولة
                 event, minutes = parsed
                 idx = data.get("app_index", -1)
+                env = _env_from_data(data)
                 _clear_state(u["id"])
-                status, result = _schedule_test(u, idx, event, minutes)
+                status, result = _schedule_test(u, idx, event, minutes, env=env)
                 if status == "ok":
                     when_txt = result.strftime("%Y-%m-%d %H:%M UTC") if hasattr(result, "strftime") else str(result)
-                    bot.reply_to(
-                        m,
-                        f"🗓 <b>تمت الجدولة</b>\nالحدث: <code>{html.escape(event)}</code>\n"
-                        f"التنفيذ: <code>{html.escape(when_txt)}</code>\nخُصم من رصيدك مقدّماً.",
-                        parse_mode="HTML",
-                    )
+                    bot.reply_to(m, _t("sched_ok", u["id"], event=html.escape(event), when=html.escape(when_txt)),
+                                 parse_mode="HTML")
                 elif status == "invalid":
                     bot.reply_to(m, _requirements_message(result))
                 elif status == "balance":
-                    bot.reply_to(m, "🚫 نفد رصيدك. تعذّرت الجدولة.")
+                    bot.reply_to(m, _t("no_credits", u["id"]))
                 else:
                     bot.reply_to(m, "تعذّرت الجدولة. أعد /apps.")
+            elif step == "edit_value":
+                job = _job_owned(data.get("job_id", 0), u)
+                field = data.get("field")
+                _clear_state(u["id"])
+                if not job:
+                    bot.reply_to(m, _t("session_over", u["id"]))
+                elif _apply_job_edit(job, field, text):
+                    bot.reply_to(m, _t("edit_done", u["id"]))
+                else:
+                    bot.reply_to(m, _t("bad_value", u["id"]))
+
+            elif step == "support_msg":
+                _clear_state(u["id"])
+                for cid in _admin_chat_ids():
+                    try:
+                        bot.send_message(int(cid), f"🆘 رسالة دعم من {u['username']} (#{u['id']}):\n{text}")
+                    except Exception:
+                        pass
+                bot.reply_to(m, _t("support_sent", u["id"]))
+
             else:
                 _clear_state(u["id"])
         except Exception as e:
@@ -1103,6 +1833,10 @@ def _register_handlers():
 
 
 _register_handlers()
+
+# تجهيز جداول الاشتراكات/المدفوعات عند الإقلاع (idempotent)
+if bot:
+    _ensure_tables()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
