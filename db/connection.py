@@ -20,16 +20,12 @@ import config
 logger = logging.getLogger(__name__)
 
 # ─── Connection Pool ─────────────────────────────────────────────────────────
-# minconn=2  : اثنان دائماً مفتوحان (للـ web و worker)
-# maxconn=20 : سقف المشاركين المتزامنين؛ يكفي لـ 1000 مستخدم مع Supabase pooler
 _pool: pool.ThreadedConnectionPool | None = None
 _pool_lock = threading.Lock()
 
 
 def get_pool() -> pool.ThreadedConnectionPool:
-    """
-    يُنشئ الـ pool مرة واحدة فقط ويعيده (Singleton آمن ضد التزامن).
-    """
+    """يُنشئ الـ pool مرة واحدة فقط ويعيده (Singleton آمن ضد التزامن)."""
     global _pool
     if _pool is None or _pool.closed:
         with _pool_lock:
@@ -38,7 +34,7 @@ def get_pool() -> pool.ThreadedConnectionPool:
                     minconn=2,
                     maxconn=20,
                     dsn=config.DATABASE_URL,
-                    cursor_factory=extras.RealDictCursor,  # النتائج كـ dict مباشرة
+                    cursor_factory=extras.RealDictCursor,
                 )
                 logger.info("[DB] Connection pool initialized.")
     return _pool
@@ -46,14 +42,7 @@ def get_pool() -> pool.ThreadedConnectionPool:
 
 @contextlib.contextmanager
 def get_conn() -> Generator:
-    """
-    Context manager يُعيد connection من الـ pool ويُعيده تلقائياً عند الانتهاء.
-
-    الاستخدام:
-        with get_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT ...")
-    """
+    """Context manager يُعيد connection من الـ pool ويُعيده تلقائياً عند الانتهاء."""
     p = get_pool()
     conn = p.getconn()
     try:
@@ -67,10 +56,7 @@ def get_conn() -> Generator:
 
 
 def init_db() -> None:
-    """
-    يُنشئ الجداول إن لم تكن موجودة.
-    يُستدعى مرة واحدة عند بدء تشغيل الـ web service.
-    """
+    """يُنشئ الجداول إن لم تكن موجودة. يُستدعى مرة واحدة عند بدء تشغيل الـ web service."""
     schema = """
         CREATE TABLE IF NOT EXISTS users (
             id         SERIAL PRIMARY KEY,
@@ -114,6 +100,7 @@ def init_db() -> None:
             dev_key     TEXT DEFAULT '',
             gaid        TEXT DEFAULT '',
             afid        TEXT DEFAULT '',
+            os          TEXT DEFAULT '',
             run_at      TIMESTAMPTZ,
             enabled     INTEGER DEFAULT 1,
             last_run    TIMESTAMPTZ,
@@ -121,6 +108,9 @@ def init_db() -> None:
             last_output TEXT,
             created     TIMESTAMPTZ DEFAULT NOW()
         );
+
+        -- توافق رجعي: إضافة العمود للجداول الموجودة مسبقاً دون فقدان بيانات
+        ALTER TABLE scheduled_jobs ADD COLUMN IF NOT EXISTS os TEXT DEFAULT '';
 
         CREATE TABLE IF NOT EXISTS job_logs (
             id      SERIAL PRIMARY KEY,
@@ -142,7 +132,6 @@ def init_db() -> None:
             created_at TIMESTAMPTZ DEFAULT NOW()
         );
 
-        -- فهارس لتسريع الاستعلامات الشائعة
         CREATE INDEX IF NOT EXISTS idx_sessions_user    ON sessions(user_id);
         CREATE INDEX IF NOT EXISTS idx_jobs_user        ON scheduled_jobs(user_id);
         CREATE INDEX IF NOT EXISTS idx_jobs_run_at      ON scheduled_jobs(run_at) WHERE enabled = 1;
@@ -154,7 +143,6 @@ def init_db() -> None:
         with conn.cursor() as cur:
             cur.execute(schema)
 
-            # إنشاء مستخدم admin افتراضي إن لم يوجد
             import hashlib
             admin_pw = hashlib.sha256(b"admin123").hexdigest()
             cur.execute("""
