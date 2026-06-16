@@ -1,16 +1,11 @@
 """
 tasks/job_tasks.py — مهام Celery
 
-هذا الملف يحتوي على المنطق الفعلي للتنفيذ في الخلفية.
 الـ Worker يُشغّل هذا الكود معزولاً عن الـ Flask API تماماً.
 
-إصلاحات هذه النسخة:
-  • المطالبة الذرّية بالمهام المستحقة (يمنع الإرسال المزدوج عند تداخل دورات Beat).
-  • معالجة ConnectionError على مستوى الحدث بدل إعادة تشغيل المهمة كاملةً
-    (يمنع تكرار إرسال الأحداث التي نجحت — الأحداث ليست idempotent).
-  • Exponential backoff حقيقي عند إعادة المحاولة قبل أي إرسال.
-  • ترميز بيانات اعتماد البروكسي (يمنع كسر الرابط بمحارف خاصة).
-  • بوابة تحقق صارمة (Validation Gate) تمنع تنفيذ أي مهمة ببيانات ناقصة.
+تحديث هذه النسخة (عزل البيانات):
+  • يُقرأ os مباشرةً من سجل المهمة (scheduled_jobs.os) لا من tg_env العام.
+  • توافق رجعي: المهام القديمة بلا os تُعامَل كأندرويد (advertising_id).
 """
 import json
 import logging
@@ -26,20 +21,17 @@ from db.connection import get_conn
 logger = logging.getLogger(__name__)
 
 
-# ─── Helper: بناء إعدادات الـ Proxy ──────────────────────────────────────────
 def _build_proxies(host: str, port: str, user: str, passwd: str) -> dict | None:
     if not host:
         return None
     creds = ""
     if user:
-        # ترميز آمن للمستخدم/كلمة المرور (قد تحتوي @ : / ...)
         creds = f"{quote(str(user), safe='')}:{quote(str(passwd or ''), safe='')}@"
     p   = port or "80"
     url = f"http://{creds}{host}:{p}"
     return {"http": url, "https": url}
 
 
-# ─── Helper: إرسال إشعار Telegram ────────────────────────────────────────────
 def _send_telegram(token: str, chat_id: str, text: str) -> None:
     """إرسال إشعار Telegram — الأخطاء لا توقف المهمة الرئيسية."""
     try:
@@ -52,9 +44,8 @@ def _send_telegram(token: str, chat_id: str, text: str) -> None:
         logger.warning(f"[Telegram] Failed to send notification: {e}")
 
 
-# ─── المهمة المجدولة: مسح Jobs المستحقة كل دقيقة ────────────────────────────
 def _get_user_env(user_id) -> dict:
-    """يقرأ بيئة المختبِر (tg_env) من user_data: os / gaid / idfa / afid / proxy."""
+    """يقرأ بيئة المختبِر (tg_env) من user_data: afid / gaid / idfa (للتوافق الرجعي)."""
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
@@ -87,13 +78,6 @@ def _notify_enabled(user_id) -> bool:
 
 @celery.task(name="tasks.job_tasks.scan_and_dispatch_due_jobs")
 def scan_and_dispatch_due_jobs() -> dict:
-    """
-    تُستدعى كل دقيقة من Celery Beat.
-
-    تستخدم *مطالبة ذرّية*: عبارة UPDATE ... RETURNING واحدة تُعطّل المهام
-    المستحقة وتستعيدها معاً، فلا يمكن لدورتَي Beat متتاليتين التقاط نفس
-    المهمة وإرسالها مرتين (إصلاح سباق الإرسال المزدوج).
-    """
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     dispatched = []
 
@@ -118,42 +102,18 @@ def scan_and_dispatch_due_jobs() -> dict:
     return {"dispatched": dispatched, "checked_at": now_str}
 
 
-# ─── المهمة الرئيسية: تنفيذ Job واحد ────────────────────────────────────────
 @celery.task(
     name="tasks.job_tasks.execute_job",
-    bind=True,                          # self يُتيح إعادة المحاولة
+    bind=True,
     max_retries=config.TASK_MAX_RETRIES,
     default_retry_delay=config.TASK_RETRY_BACKOFF,
     acks_late=True,
 )
 def execute_job(self, job_id: int, _sent_events: list | None = None) -> dict:
-    """
-    تنفّذ جميع الـ Events الخاصة بـ Job معين وتحفظ نتائجها.
-
-    التحصينات المطبّقة:
-        1. State-Locked  : جميع بيانات البيئة تُقرأ مرة واحدة وتُخزَّن في متغيرات
-                           محلية ثابتة — لا استدعاء خارجي داخل حلقة التكرار.
-        2. Fail-Fast     : بوابة تحقق صارمة على dev_key و device_id و os_
-                           تُوقف المهمة فوراً وتُسجّل CRITICAL في job_logs.
-        3. Idempotency   : قائمة _sent_events تنتقل عبر retry.kwargs لضمان
-                           عدم إعادة إرسال أي حدث نجح في محاولة سابقة.
-
-    سياسة إعادة المحاولة (آمنة ضد التكرار):
-        - تُعيد تشغيل المهمة كاملةً *فقط* إذا حدث خطأ اتصال قبل إرسال أي حدث.
-        - بعد إرسال أي حدث، أخطاء الاتصال تُسجَّل كفشل ولا تُعيد التشغيل
-          (حتى لا تتكرّر الأحداث التي نجحت مسبقاً).
-        - الـ backoff أُسّي: الانتظار يتضاعف مع كل محاولة.
-    """
     logger.info(f"[Worker] Starting job {job_id} (retry={self.request.retries})")
 
-    # ════════════════════════════════════════════════════════════════════
-    # التحصين ③ — Idempotency Control
-    # sent_events يحمل أسماء الأحداث التي أُرسلت بنجاح في محاولات سابقة.
-    # يُمرَّر عبر kwargs عند كل retry لئلا يُعاد إرسالها.
-    # ════════════════════════════════════════════════════════════════════
     sent_events: set[str] = set(_sent_events or [])
 
-    # ── جلب بيانات المهمة والمستخدم — استدعاء واحد، لا يتكرر لاحقاً ────
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM scheduled_jobs WHERE id = %s", (job_id,))
@@ -166,14 +126,16 @@ def execute_job(self, job_id: int, _sent_events: list | None = None) -> dict:
             user = cur.fetchone()
 
     # ════════════════════════════════════════════════════════════════════
-    # التحصين ① — State-Locked
-    # تُقرأ بيانات البيئة هنا مرة واحدة وتُجمَّد في متغيرات محلية.
-    # لا يوجد أي استدعاء لـ _get_user_env أو قاعدة البيانات داخل الحلقة.
+    # ① State-Locked — تُقرأ بيانات البيئة مرة واحدة وتُجمَّد.
+    # عزل البيانات: os من سجل المهمة مباشرةً (لا من tg_env العام).
+    # afid/device_id يبقيان بمنطقهما الحالي (env ثم سجل المهمة) للتوافق الرجعي.
     # ════════════════════════════════════════════════════════════════════
-    env      = _get_user_env(job["user_id"])          # ← الاستدعاء الوحيد لـ tg_env
-    os_      = (env.get("os") or "").lower().strip()  # مجمَّد — لا يُعاد تعريفه
+    env      = _get_user_env(job["user_id"])          # لـ afid/device fallback فقط
+    os_      = (job.get("os") or "").lower().strip()  # ← من سجل المهمة (معزول)
+    if not os_:
+        os_ = "android"                               # توافق رجعي: مهام قديمة بلا os → أندرويد
     afid     = (env.get("afid") or job.get("afid") or "").strip()
-    dev_key  = (job.get("dev_key") or "").strip()     # مجمَّد — لا يُعاد تعريفه
+    dev_key  = (job.get("dev_key") or "").strip()
 
     if os_ == "ios":
         device_id = (env.get("idfa") or job.get("gaid") or "").strip()
@@ -187,12 +149,9 @@ def execute_job(self, job_id: int, _sent_events: list | None = None) -> dict:
     )
 
     # ════════════════════════════════════════════════════════════════════
-    # التحصين ② — Fail-Fast Validation Gate
-    # تُبنى الـ Payload فقط بعد التحقق من الحقول الحيوية الثلاثة.
-    # أي حقل فارغ → CRITICAL في job_logs والخروج الفوري.
+    # ② Fail-Fast Validation Gate (os صار له افتراضي آمن، فلا يُفحَص هنا)
     # ════════════════════════════════════════════════════════════════════
     def _critical_abort(field: str) -> dict:
-        """توقف المهمة فوراً وتُسجّل الخطأ الحيوي."""
         error_msg = f"CRITICAL: Missing {field}"
         logger.error(f"[Worker] Job {job_id} aborted — {error_msg}")
         _update_job_status(job_id, "failed", error_msg)
@@ -201,40 +160,29 @@ def execute_job(self, job_id: int, _sent_events: list | None = None) -> dict:
     if not dev_key:
         return _critical_abort("dev_key")
 
-    if not os_:
-        return _critical_abort("os (tg_env.os)")
-
     if not device_id:
         field = "idfa" if os_ == "ios" else "advertising_id (gaid)"
         return _critical_abort(field)
 
-    # ─────────────────────────────────────────────────────────────────────
-    # من هنا: dev_key ، os_ ، device_id — مضمونة غير فارغة ومجمَّدة.
-    # لا يُعاد تعريفها أو الاستعلام عنها في أي مكان أدناه.
-    # ─────────────────────────────────────────────────────────────────────
-
     output_log = ""
     all_ok     = True
 
-    # ── تنفيذ كل Event بشكل منفرد ────────────────────────────────────────
     for ev in events:
         ev_name = ev.get("name", "").replace("{}", "1")
 
-        # التحصين ③: تجاوز الأحداث التي أُرسلت بنجاح في محاولة سابقة
         if ev_name in sent_events:
             logger.info(f"[Worker] Job {job_id} skipping already-sent event '{ev_name}'")
             output_log += f"[{ev_name}] → SKIPPED (sent in prior retry)\n"
             continue
 
         try:
-            # بناء الـ Payload بعد اجتياز بوابة التحقق — لا قيم null/empty ممكنة هنا
             body = {
                 "appsflyer_id": afid,
                 "eventName":    ev_name,
                 "eventTime":    datetime.now(timezone.utc).isoformat(),
                 "eventValue":   "{}",
             }
-            # يستخدم المتغيرات المجمَّدة المُفحوصة أعلاه فقط — لا job.get() هنا
+            # المفتاح الصحيح بحسب os الخاص بالمهمة (عزل البيانات)
             if os_ == "ios":
                 body["idfa"] = device_id
             else:
@@ -252,7 +200,7 @@ def execute_job(self, job_id: int, _sent_events: list | None = None) -> dict:
             if not ok_event:
                 all_ok = False
             else:
-                sent_events.add(ev_name)  # سُجِّل للحماية من إعادة الإرسال عند retry
+                sent_events.add(ev_name)
 
             _log_event_history(job["user_id"], job["package"], ev_name, resp.status_code, ok_event)
 
@@ -262,8 +210,6 @@ def execute_job(self, job_id: int, _sent_events: list | None = None) -> dict:
             logger.warning(f"[Worker] Job {job_id} event '{ev_name}' timed out.")
 
         except requests.ConnectionError as exc:
-            # إعادة تشغيل مسموحة فقط قبل إرسال أي حدث ناجح في هذه المحاولة.
-            # sent_events تحمي الأحداث الناجحة من الجولات السابقة تلقائياً.
             if not sent_events and self.request.retries < self.max_retries:
                 backoff = config.TASK_RETRY_BACKOFF * (2 ** self.request.retries)
                 logger.warning(
@@ -273,9 +219,8 @@ def execute_job(self, job_id: int, _sent_events: list | None = None) -> dict:
                 raise self.retry(
                     exc=exc,
                     countdown=backoff,
-                    kwargs={"_sent_events": list(sent_events)},  # ينقل الحالة للمحاولة التالية
+                    kwargs={"_sent_events": list(sent_events)},
                 )
-            # بعد إرسال أحداث ناجحة: سجّل الفشل وتابع بقية الأحداث دون retry
             output_log += f"[{ev_name}] → CONNECTION_ERROR\n"
             all_ok = False
             logger.warning(f"[Worker] Job {job_id} event '{ev_name}' connection error: {exc}")
@@ -285,12 +230,9 @@ def execute_job(self, job_id: int, _sent_events: list | None = None) -> dict:
             all_ok = False
             logger.error(f"[Worker] Job {job_id} unexpected error: {exc}")
 
-    # ── تحديث حالة المهمة في قاعدة البيانات ──────────────────────────────
     final_status = "success" if all_ok else "partial_error"
     _update_job_status(job_id, final_status, output_log[:2000])
 
-    # ── إشعار Telegram — مشروط بـ notify_enabled ومعزول تماماً ───────────
-    # try/except منفصل ومستقل: أي خطأ في تلغرام لا يوقف المهمة ولا يؤثر على الـ Worker.
     try:
         if user and user.get("tg_chat_id") and _notify_enabled(job["user_id"]):
             token = config.TELEGRAM_BOT_TOKEN or user.get("tg_token") or ""
@@ -311,7 +253,6 @@ def execute_job(self, job_id: int, _sent_events: list | None = None) -> dict:
     return {"job_id": job_id, "status": final_status}
 
 
-# ─── Helpers داخلية ───────────────────────────────────────────────────────────
 def _log_event_history(user_id, game, event_name, status, ok):
     try:
         with get_conn() as conn:
@@ -333,7 +274,7 @@ def _update_job_status(job_id, status, output):
                     SET last_status = %s,
                         last_output = %s,
                         last_run    = NOW(),
-                        enabled     = 0         -- أوقف المهمة بعد التنفيذ
+                        enabled     = 0
                     WHERE id = %s
                 """, (status, output, job_id))
                 cur.execute("""
