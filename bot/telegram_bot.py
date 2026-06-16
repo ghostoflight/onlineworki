@@ -988,6 +988,7 @@ _MENU_KEYS = [
     ("btn_settings", "settings"),
     ("btn_balance",  "balance"),
     ("btn_services", "services"),
+    ("btn_lang",     "lang"),
 ]
 
 
@@ -996,6 +997,7 @@ def _main_menu_kb(uid):
     kb.row(_t("btn_new_task", uid), _t("btn_apps", uid))
     kb.row(_t("btn_profile", uid), _t("btn_settings", uid))
     kb.row(_t("btn_balance", uid), _t("btn_services", uid))
+    kb.row(_t("btn_lang", uid))
     return kb
 
 
@@ -1619,6 +1621,13 @@ def _register_handlers():
             bot.reply_to(m, locales.lookup("need_start"))
             return
         target = _menu_target(m.text)
+        if target == "lang":
+            h_lang(m, u) # سيستدعي دالة تغيير اللغة التي برمجناها
+        elif target == "add":
+            _set_state(u["id"], "add_name", {})
+            _send_add_step(m.chat.id, "add_name", {})
+        elif target == "apps":
+            _open_apps(m.chat.id, u)
         if target == "add":
             _set_state(u["id"], "add_name", {})
             _send_add_step(m.chat.id, "add_name", {})
