@@ -988,7 +988,6 @@ _MENU_KEYS = [
     ("btn_settings", "settings"),
     ("btn_balance",  "balance"),
     ("btn_services", "services"),
-    ("btn_lang",     "lang"),
 ]
 
 
@@ -997,7 +996,6 @@ def _main_menu_kb(uid):
     kb.row(_t("btn_new_task", uid), _t("btn_apps", uid))
     kb.row(_t("btn_profile", uid), _t("btn_settings", uid))
     kb.row(_t("btn_balance", uid), _t("btn_services", uid))
-    kb.row(_t("btn_lang", uid))
     return kb
 
 
@@ -1501,113 +1499,59 @@ def _register_handlers():
         _send_add_step(m.chat.id, "add_name", {})
 
     @bot.callback_query_handler(func=lambda c: (c.data or "").startswith("add:"))
-
     def h_add_cb(c):
-
         u = _user_by_chat(c.message.chat.id)
-
         if not u:
-
             bot.answer_callback_query(c.id, "أرسل /start أولاً")
-
             return
-
         action = c.data.split(":", 1)[1]
-
         if action == "cancel":
-
             _clear_state(u["id"])
-
             bot.answer_callback_query(c.id, "أُلغي")
-
             bot.send_message(c.message.chat.id, "❌ تم إلغاء إنشاء المهمة.")
-
             return
-
         if action == "restart":
-
             _set_state(u["id"], "add_name", {})
-
             bot.answer_callback_query(c.id)
-
             _send_add_step(c.message.chat.id, "add_name", {})
-
             return
-
         if action == "back":
-
             step, data = _get_state(u["id"])
-
             prev = _ADD_PREV.get(step)
-
             bot.answer_callback_query(c.id)
-
             if prev:
-
                 _set_state(u["id"], prev, data)
-
                 _send_add_step(c.message.chat.id, prev, data)
-
             return
-
         if action == "save":
-
             step, data = _get_state(u["id"])
-
             if step != "awaiting_confirm":
-
                 bot.answer_callback_query(c.id, "انتهت الجلسة")
-
                 return
-
             if not all(data.get(k) for k in ("name", "package", "dev_key", "events")):
-
                 _clear_state(u["id"])
-
                 bot.answer_callback_query(c.id)
-
                 bot.send_message(c.message.chat.id, "بيانات ناقصة. أعد /add.")
-
                 return
-
             jid = _save_add_job(u, data)
-
             _clear_state(u["id"])
-
             bot.answer_callback_query(c.id, "تم الحفظ")
-
             if jid:
-
                 env = _get_env(u["id"])
-
                 ready = (env.get("os") and (env.get("gaid") or env.get("idfa")) and env.get("afid"))
-
                 note = "" if ready else "\n\n⚠️ بيئة جهازك غير مكتملة — أكملها عبر /profile قبل التشغيل."
-
                 bot.send_message(
-
                     c.message.chat.id,
-
                     f"✅ <b>تم حفظ المهمة</b> (#{jid}).\nستُنفَّذ خلال دقيقة عند أقرب مسح.{note}",
-
                     parse_mode="HTML",
-
                 )
-
             else:
-
                 bot.send_message(c.message.chat.id, "❌ تعذّر حفظ المهمة. حاول لاحقاً.")
-
             return
-
         if action.startswith("exv:"):
-
             value = action[len("exv:"):]
-
             bot.answer_callback_query(c.id)
-
             _add_advance(c.message.chat.id, u, value)
-
             return
 
     # ── القائمة الرئيسية (ReplyKeyboard) — تربط الأزرار بالأوامر (i18n) ───────
@@ -1621,13 +1565,6 @@ def _register_handlers():
             bot.reply_to(m, locales.lookup("need_start"))
             return
         target = _menu_target(m.text)
-        if target == "lang":
-            h_lang(m, u) # سيستدعي دالة تغيير اللغة التي برمجناها
-        elif target == "add":
-            _set_state(u["id"], "add_name", {})
-            _send_add_step(m.chat.id, "add_name", {})
-        elif target == "apps":
-            _open_apps(m.chat.id, u)
         if target == "add":
             _set_state(u["id"], "add_name", {})
             _send_add_step(m.chat.id, "add_name", {})
