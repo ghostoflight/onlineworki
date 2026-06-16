@@ -23,6 +23,7 @@ import hashlib
 import html
 import logging
 import threading
+import time as _time
 from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 from datetime import datetime, timezone
@@ -70,13 +71,48 @@ def _default_dev_key() -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# In-memory user cache: tg_chat_id → user dict (TTL 60s)
+# Thread-safe: dict.pop / dict.__setitem__ / dict.get are each atomic in CPython
+# (GIL), which is sufficient for a TTL read-through cache. No data is lost if a
+# race causes two threads to both miss the cache simultaneously — the worst
+# outcome is two identical SELECT queries, both returning the same row.
+# ═══════════════════════════════════════════════════════════════════════════════
+_USER_CACHE: dict = {}          # {chat_id_str: (user_dict, expire_ts)}
+_USER_CACHE_TTL = 60            # ثانية — قصير بما يكفي لتمييز تغييرات الرصيد
+
+
+def _cache_set(chat_id, user):
+    _USER_CACHE[str(chat_id)] = (user, _time.monotonic() + _USER_CACHE_TTL)
+
+
+def _cache_get(chat_id):
+    entry = _USER_CACHE.get(str(chat_id))
+    if entry and entry[1] > _time.monotonic():
+        return entry[0]
+    return None
+
+
+def _cache_del(chat_id):
+    _USER_CACHE.pop(str(chat_id), None)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # مستخدمون
 # ═══════════════════════════════════════════════════════════════════════════════
 def _user_by_chat(chat_id) -> dict | None:
+    cached = _cache_get(chat_id)
+    if cached:
+        return cached
     with get_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT * FROM users WHERE tg_chat_id = %s AND active = 1", (str(chat_id),))
-            return cur.fetchone()
+            cur.execute(
+                "SELECT * FROM users WHERE tg_chat_id = %s AND active = 1",
+                (str(chat_id),)
+            )
+            user = cur.fetchone()
+    if user:
+        _cache_set(chat_id, user)
+    return user
 
 
 def _user_by_id(user_id) -> dict | None:
@@ -124,12 +160,16 @@ def _set_chat(user_id, chat_id):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE users SET tg_chat_id=%s WHERE id=%s", (str(chat_id), user_id))
+    # Invalidate cache: the user row has changed (tg_chat_id assignment).
+    _cache_del(chat_id)
 
 
 def _clear_chat(chat_id):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE users SET tg_chat_id=NULL WHERE tg_chat_id=%s", (str(chat_id),))
+    # Invalidate cache: the user is now unlinked from this chat_id.
+    _cache_del(chat_id)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -535,7 +575,10 @@ def _list_pending_payments(limit=10):
 
 
 def _grant_subscription(user_id, plan_key):
-    """Activates a subscription and adds credits (called on payment approval/admin grant)."""
+    """Activates a subscription and adds credits (called on payment approval/admin grant).
+    Invalidates the user cache for every chat_id associated with this user so that
+    the updated uses_left is reflected immediately on the next interaction.
+    """
     p = _get_plan(plan_key)
     if not p:
         return None
@@ -552,6 +595,15 @@ def _grant_subscription(user_id, plan_key):
                 "UPDATE users SET uses_left = uses_left + %s, max_uses = max_uses + %s WHERE id=%s",
                 (int(p["credits"]), int(p["credits"]), user_id),
             )
+    # Invalidate cache: uses_left / max_uses have changed for this user.
+    # We must look up the chat_id from the DB since _grant_subscription only
+    # receives user_id (not chat_id).
+    try:
+        target = _user_by_id(user_id)
+        if target and target.get("tg_chat_id"):
+            _cache_del(target["tg_chat_id"])
+    except Exception as e:
+        logger.warning(f"[Telegram] cache invalidation after grant failed: {e}")
     return expires
 
 
@@ -656,15 +708,32 @@ def _admin_add_credits(uid, n) -> None:
                 "max_uses = GREATEST(max_uses, uses_left + %s) WHERE id=%s",
                 (n, n, uid),
             )
+    # Invalidate cache: uses_left has changed.
+    try:
+        target = _user_by_id(uid)
+        if target and target.get("tg_chat_id"):
+            _cache_del(target["tg_chat_id"])
+    except Exception as e:
+        logger.warning(f"[Telegram] cache invalidation after add_credits failed: {e}")
 
 
 def _delete_user(uid) -> None:
     """Removes a user and all dependent rows (FK-cascade + the FK-less tables)."""
+    # Fetch the chat_id before deletion so we can evict the cache entry.
+    try:
+        target = _user_by_id(uid)
+        chat_id = target.get("tg_chat_id") if target else None
+    except Exception:
+        chat_id = None
+
     with get_conn() as conn:
         with conn.cursor() as cur:
             for t in ("subscriptions", "payments", "support_tickets"):
                 cur.execute(f"DELETE FROM {t} WHERE user_id=%s", (uid,))
             cur.execute("DELETE FROM users WHERE id=%s", (uid,))   # cascades the rest
+
+    if chat_id:
+        _cache_del(chat_id)
 
 
 # ── Admin dashboard renderers (module-level; HTML, each ends with a Home btn) ─
@@ -818,6 +887,10 @@ def _consume_use(user):
                 (user["id"],),
             )
             row = cur.fetchone()
+    # Invalidate cache: uses_left has been decremented (or the update was a no-op,
+    # but evicting on no-op is harmless — just one extra SELECT on next access).
+    if user.get("tg_chat_id"):
+        _cache_del(user["tg_chat_id"])
     return (True, row["uses_left"]) if row else (False, 0)
 
 
@@ -827,6 +900,9 @@ def _refund_use(user):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE users SET uses_left = uses_left + 1 WHERE id=%s", (user["id"],))
+    # Invalidate cache: uses_left has been incremented.
+    if user.get("tg_chat_id"):
+        _cache_del(user["tg_chat_id"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
