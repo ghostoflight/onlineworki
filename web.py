@@ -1,3 +1,6 @@
+bash
+
+cd /home/claude/project_fixed && mkdir -p . && cat > web.py << 'PYEOF'
 """
 web.py — Flask API Service
 
@@ -37,6 +40,9 @@ CORS(app, origins="*")
 
 SAFE_PKG_RE = re.compile(r"^[a-zA-Z0-9_\-\.]+$")
 
+# مفاتيح معرّفات الجهاز المقبولة — تُفحَص ديناميكياً مهما كان نظام المهمة
+DEVICE_ID_KEYS = ("advertising_id", "idfa", "appsflyer_id", "gaid", "oaid", "android_id")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # HELPERS
@@ -60,10 +66,35 @@ def get_user_from_token(token: str) -> dict | None:
     return dict(row) if row else None
 
 
+def _has_active_sub(user_id: int) -> bool:
+    """
+    يتحقّق من وجود اشتراك فعّال للمستخدم في جدول subscriptions.
+    يستخدم to_regclass للتأكّد من وجود الجدول قبل الاستعلام (توافق رجعي:
+    لا يفشل لو لم يُنشأ الجدول بعد).
+    """
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT to_regclass('public.subscriptions') AS t")
+                reg = cur.fetchone()
+                if not reg or not reg.get("t"):
+                    return False
+                cur.execute(
+                    "SELECT 1 FROM subscriptions "
+                    "WHERE user_id = %s AND status = 'active' AND expires_at > NOW() LIMIT 1",
+                    (user_id,),
+                )
+                return cur.fetchone() is not None
+    except Exception as e:
+        logger.warning(f"[Sub] active-sub check failed: {e}")
+        return False
+
+
 def check_access(user: dict) -> tuple[bool, str | None]:
     if user["role"] == "admin":
         return True, None
-    if user["uses_left"] <= 0:
+    # نفاد الرصيد لا يحجب المستخدم إذا كان لديه اشتراك فعّال
+    if user["uses_left"] <= 0 and not _has_active_sub(user["id"]):
         return False, "Usage limit reached"
     if user["expire_at"]:
         try:
@@ -383,8 +414,9 @@ def proxy_send_event():
         return jsonify({"success": False, "error": "package and dev_key must not be empty"}), 400
     if not isinstance(body_data, dict) or not str(body_data.get("eventName", "")).strip():
         return jsonify({"success": False, "error": "body must include a non-empty eventName"}), 400
-    if not any(str(body_data.get(k, "")).strip() for k in ("advertising_id", "idfa", "appsflyer_id")):
-        return jsonify({"success": False, "error": "body must include a device identifier (advertising_id/idfa/appsflyer_id)"}), 400
+    # قبول أيّ مفتاح معرّف جهاز صالح ديناميكياً (يدعم اختلاف أنظمة التشغيل)
+    if not any(str(body_data.get(k, "")).strip() for k in DEVICE_ID_KEYS):
+        return jsonify({"success": False, "error": "body must include a valid device identifier"}), 400
 
     event_name = body_data.get("eventName", "unknown")
 
@@ -488,10 +520,14 @@ def create_job():
     # بوابة الصدّ: تحقّق من وجود بيانات فعلية قبل الإدراج (يمنع صفوفاً معطوبة)
     package = str(data.get("package", "")).strip()
     dev_key = str(data.get("dev_key", "")).strip()
-    gaid    = str(data.get("gaid", "")).strip()
+    # توحيد معرّف الجهاز: gaid أو idfa — لا اعتماد على مفتاح مرتبط بنظام بعينه
+    device_id = str(data.get("gaid", "") or data.get("idfa", "")).strip()
     afid    = str(data.get("afid", "")).strip()
+    # نظام المهمة (عزل البيانات) — افتراضي android
+    os_val  = (str(data.get("os", "android")).strip().lower() or "android")
+
     missing = [k for k, v in (("package", package), ("dev_key", dev_key),
-                              ("gaid", gaid), ("afid", afid)) if not v]
+                              ("device_id", device_id), ("afid", afid)) if not v]
     if missing:
         return jsonify({"error": "Missing required fields: " + ", ".join(missing)}), 400
     if not isinstance(events, list) or not all(
@@ -505,15 +541,15 @@ def create_job():
                 INSERT INTO scheduled_jobs
                     (user_id, name, events, run_at,
                      proxy_host, proxy_port, proxy_user, proxy_pass,
-                     package, dev_key, gaid, afid, enabled)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
+                     package, dev_key, gaid, afid, os, enabled)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1)
                 RETURNING id
             """, (
                 request.current_user["id"], name,
                 json.dumps(events), run_at_norm,
                 data.get("proxy_host", ""), data.get("proxy_port", ""),
                 data.get("proxy_user", ""), data.get("proxy_pass", ""),
-                package, dev_key, gaid, afid,
+                package, dev_key, device_id, afid, os_val,
             ))
             jid = cur.fetchone()["id"]
     return jsonify({"ok": True, "id": jid})
@@ -538,11 +574,14 @@ def update_job(job_id):
             except Exception:
                 return jsonify({"error": "Invalid run_at format"}), 400
 
+            # نظام المهمة — يبقى كما هو إن لم يُرسَل، وإلا الافتراضي android
+            os_val = (str(data.get("os", job.get("os") or "android")).strip().lower() or "android")
+
             cur.execute("""
                 UPDATE scheduled_jobs SET
                     name=%s, events=%s, run_at=%s, enabled=%s,
                     proxy_host=%s, proxy_port=%s, proxy_user=%s, proxy_pass=%s,
-                    package=%s, dev_key=%s, gaid=%s, afid=%s
+                    package=%s, dev_key=%s, gaid=%s, afid=%s, os=%s
                 WHERE id=%s
             """, (
                 data.get("name", job["name"]),
@@ -557,6 +596,7 @@ def update_job(job_id):
                 data.get("dev_key",    job["dev_key"]    or ""),
                 data.get("gaid",       job["gaid"]       or ""),
                 data.get("afid",       job["afid"]       or ""),
+                os_val,
                 job_id,
             ))
     return jsonify({"ok": True})
@@ -744,3 +784,5 @@ if __name__ == "__main__":
 else:
     # عند تشغيل gunicorn، نُهيّئ قاعدة البيانات هنا
     init_db()
+PYEOF
+python3 -m py_compile web.py && echo "web.py COMPILE OK"
