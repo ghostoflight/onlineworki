@@ -12,6 +12,7 @@ web.py — Flask API Service
 import hashlib
 import json
 import logging
+import os
 import re
 import secrets
 import subprocess
@@ -20,7 +21,7 @@ from datetime import datetime, timezone
 from functools import wraps
 
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response
 from flask_cors import CORS
 
 import config
@@ -30,6 +31,42 @@ from tasks.job_tasks import execute_job           # استدعاء المهمة 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# ── In-memory ring buffer of recent logs (for GET /debug/logs) ───────────────
+from collections import deque
+import threading as _threading
+
+_LOG_BUFFER = deque(maxlen=200)          # keeps the last 200 records across all levels
+_LOG_LOCK = _threading.Lock()
+
+
+class _RingBufferLogHandler(logging.Handler):
+    """Thread-safe handler that keeps the last N formatted log lines in memory."""
+    def emit(self, record):
+        try:
+            line = self.format(record)
+        except Exception:
+            self.handleError(record)
+            return
+        with _LOG_LOCK:
+            _LOG_BUFFER.append((record.levelno, line))
+
+
+_ring_handler = _RingBufferLogHandler()
+_ring_handler.setLevel(logging.DEBUG)
+_ring_handler.setFormatter(logging.Formatter(
+    "%(asctime)s %(levelname)-7s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+
+_root_logger = logging.getLogger()
+_root_logger.setLevel(logging.DEBUG)                 # let DEBUG records reach handlers
+_root_logger.addHandler(_ring_handler)
+# keep stdout at INFO so Railway's own log stream isn't flooded with DEBUG
+for _h in _root_logger.handlers:
+    if _h is not _ring_handler:
+        _h.setLevel(logging.INFO)
+# silence chatty third-party DEBUG so the buffer stays useful
+for _noisy in ("urllib3", "werkzeug", "kombu", "amqp"):
+    logging.getLogger(_noisy).setLevel(logging.INFO)
 
 # Force-log the resolved configuration this process actually sees (masked).
 try:
@@ -206,6 +243,44 @@ def telegram_unlink():
         with conn.cursor() as cur:
             cur.execute("UPDATE users SET tg_chat_id = NULL WHERE id = %s", (user["id"],))
     return jsonify({"ok": True})
+
+
+@app.get("/debug/logs")
+def debug_logs():
+    """
+    Returns the last (up to 200) captured log lines as plain text.
+
+    Query params:
+      ?n=100              → how many lines (1..200, default 200)
+      ?level=WARNING      → only this level and above (DEBUG/INFO/WARNING/ERROR)
+      ?order=desc         → newest first (default 'asc' = oldest→newest)
+    Optional gate: set env DEBUG_LOG_TOKEN and pass ?token=… to restrict access.
+    """
+    gate = os.environ.get("DEBUG_LOG_TOKEN", "")
+    if gate and request.args.get("token") != gate:
+        return Response("forbidden\n", status=403, mimetype="text/plain")
+
+    try:
+        n = max(1, min(int(request.args.get("n", 200)), 200))
+    except (TypeError, ValueError):
+        n = 200
+
+    min_level = 0
+    lvl_arg = request.args.get("level", "").upper()
+    if lvl_arg:
+        lv = logging.getLevelName(lvl_arg)        # name → int, or "Level X" if unknown
+        if isinstance(lv, int):
+            min_level = lv
+
+    with _LOG_LOCK:
+        items = list(_LOG_BUFFER)
+
+    lines = [line for (levelno, line) in items if levelno >= min_level][-n:]
+    if request.args.get("order", "asc").lower() == "desc":
+        lines.reverse()
+
+    body = "\n".join(lines) if lines else "(no logs captured yet)"
+    return Response(body + "\n", mimetype="text/plain")
 
 
 @app.get("/")
