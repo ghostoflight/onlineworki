@@ -13,7 +13,7 @@ redis==5.0.8             # Python Redis client (يستخدمه Celery كـ broke
 
 # HTTP Requests
 requests==2.32.3
-PySocks==1.7.1
+PySocks==1.7.1            # SOCKS5 proxy support for the requests library
 
 # Telegram Bot
 pyTelegramBotAPI==4.21.0
