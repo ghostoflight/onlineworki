@@ -3,11 +3,16 @@ config.py — الإعدادات المركزية للمشروع
 كل القيم تُقرأ من Environment Variables لضمان الأمان
 """
 import os
+import sys
 
 # ─── Database (Supabase / PostgreSQL) ───────────────────────────────────────
 # في Supabase: Settings → Database → Connection String → "Transaction pooler"
 # استخدم رابط الـ pooler (port 6543) وليس الـ direct (5432) في Railway
-DATABASE_URL: str = os.environ["DATABASE_URL"]   # سيرفع استثناءً إن لم يُعيَّن
+# NOTE: do NOT hard-crash on a missing var — keep the process alive so the
+# /debug/health endpoint can report exactly what's missing (no logs needed).
+DATABASE_URL: str = os.environ.get("DATABASE_URL", "")
+if not DATABASE_URL:
+    print("[config] FATAL: DATABASE_URL is not set in this service's env!", file=sys.stderr)
 
 # ─── Redis (Message Broker + Result Backend) ─────────────────────────────────
 # في Railway: أضف Redis plugin، ثم خذ REDIS_URL من المتغيرات
@@ -44,3 +49,35 @@ PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "") or (
     f"https://{os.environ['RAILWAY_PUBLIC_DOMAIN']}"
     if os.environ.get("RAILWAY_PUBLIC_DOMAIN") else ""
 )
+
+
+# ─── Diagnostics: force-log exactly what THIS process resolved ───────────────
+def _mask(url: str) -> str:
+    """Hide credentials in a URL for safe logging."""
+    if not url:
+        return "<EMPTY>"
+    import re
+    return re.sub(r"://[^@/]+@", "://***:***@", url)
+
+
+def summary() -> dict:
+    """A safe, masked snapshot of the resolved config (for /debug/health)."""
+    return {
+        "DATABASE_URL":          _mask(DATABASE_URL),
+        "DATABASE_URL_set":      bool(os.environ.get("DATABASE_URL")),
+        "CELERY_BROKER_URL":     _mask(CELERY_BROKER_URL),
+        "CELERY_RESULT_BACKEND": _mask(CELERY_RESULT_BACKEND),
+        "REDIS_URL_set":         bool(os.environ.get("REDIS_URL")),
+        "PUBLIC_BASE_URL":       PUBLIC_BASE_URL or "<EMPTY>",
+        "TELEGRAM_BOT_TOKEN_set":      bool(TELEGRAM_BOT_TOKEN),
+        "TELEGRAM_WEBHOOK_SECRET_set": bool(TELEGRAM_WEBHOOK_SECRET),
+        "DEBUG":                 DEBUG,
+    }
+
+
+def log_summary() -> None:
+    """Print the resolved config to stderr at startup (visible in Railway logs)."""
+    print("[config] ===== resolved configuration this process sees =====", file=sys.stderr)
+    for k, v in summary().items():
+        print(f"[config]   {k} = {v}", file=sys.stderr)
+    print("[config] ========================================================", file=sys.stderr)
