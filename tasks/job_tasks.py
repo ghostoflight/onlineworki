@@ -31,6 +31,28 @@ def _mask_key(dev_key: str) -> str:
     return (dev_key[:4] + "…" + str(len(dev_key)) + "c") if dev_key else "<none>"
 
 
+def _dev_key_for_package(package: str) -> str:
+    """
+    Resolve the AppsFlyer dev_key for a package from games_config.GAMES_DATA.
+
+    The dev_key is CONFIG-ONLY — it is never asked from the user and never stored
+    in the DB job row. We match the job's `package` against the static config and
+    return its key. Returns '' if the package is absent or has no key.
+    """
+    try:
+        from games_config import GAMES_DATA
+    except Exception as e:
+        logger.error("[Worker] cannot import games_config.GAMES_DATA: %s", e)
+        return ""
+    target = str(package or "").strip()
+    for g in GAMES_DATA:
+        if str(g.get("package", "")).strip() == target:
+            return str(g.get("dev_key", "") or "").strip()
+    logger.error("[Worker] package '%s' not found in games_config.GAMES_DATA (%d apps configured).",
+                 target, len(GAMES_DATA))
+    return ""
+
+
 def _build_proxies(host: str, port: str, user: str, passwd: str, scheme: str = "http") -> dict | None:
     if not host:
         return None
@@ -105,33 +127,61 @@ def _notify_enabled(user_id) -> bool:
         return True
 
 
+@celery.task(name="tasks.job_tasks.debug_ping")
+def debug_ping() -> str:
+    """Round-trip probe: proves web → Redis → worker → result backend all work."""
+    logger.info("[Ping] debug_ping executed on the worker ✅")
+    return "pong"
+
+
 @celery.task(name="tasks.job_tasks.scan_and_dispatch_due_jobs")
 def scan_and_dispatch_due_jobs() -> dict:
     """
     Beat entrypoint (every minute). Lock-free claim: a single
     UPDATE ... RETURNING flips due jobs to enabled=0 and returns them atomically,
-    so two overlapping beat ticks can never grab the same job twice.
+    so two overlapping beat ticks can never grab the same job twice, and a
+    container restart can never double-dispatch (the row is already claimed).
     """
-    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now(timezone.utc)
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    logger.info("[Beat] scan tick @ %s UTC — checking for due jobs…", now_str)
     dispatched = []
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE scheduled_jobs
+                    SET enabled = 0
+                    WHERE enabled = 1
+                      AND run_at IS NOT NULL
+                      AND run_at <= NOW()
+                    RETURNING id, name, run_at
+                """)
+                due_jobs = cur.fetchall()
+    except Exception as e:
+        logger.error("[Beat] scan query FAILED: %s", e)
+        return {"dispatched": [], "error": str(e), "checked_at": now_str}
 
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                UPDATE scheduled_jobs
-                SET enabled = 0
-                WHERE enabled = 1
-                  AND run_at IS NOT NULL
-                  AND run_at <= NOW()
-                RETURNING id, name
-            """)
-            due_jobs = cur.fetchall()
+    if not due_jobs:
+        logger.info("[Beat] no due jobs this tick.")
+        return {"dispatched": [], "checked_at": now_str}
 
+    logger.info("[Beat] %d job(s) due — dispatching to the worker queue.", len(due_jobs))
     for job in due_jobs:
         jid = job["id"]
-        logger.info(f"[Beat] Dispatching job {jid}: {job['name']}")
-        execute_job.apply_async(args=[jid], countdown=0)
-        dispatched.append(jid)
+        try:
+            execute_job.apply_async(args=[jid], countdown=0)
+            logger.info("[Beat] queued job %s (%s), run_at=%s", jid, job["name"], job.get("run_at"))
+            dispatched.append(jid)
+        except Exception as e:
+            # re-enable so the next tick retries (broker hiccup, etc.)
+            logger.error("[Beat] failed to queue job %s: %s — re-enabling for retry", jid, e)
+            try:
+                with get_conn() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("UPDATE scheduled_jobs SET enabled = 1 WHERE id = %s", (jid,))
+            except Exception:
+                pass
 
     return {"dispatched": dispatched, "checked_at": now_str}
 
@@ -165,7 +215,12 @@ def execute_job(self, job_id: int, _sent_events: list | None = None) -> dict:
     if not os_:
         os_ = "android"                               # backward-compat default
     afid     = (env.get("afid") or job.get("afid") or "").strip()
-    dev_key  = (job.get("dev_key") or "").strip()     # package-specific, from the job row
+    package  = job["package"]
+    url      = APPSFLYER_URL.format(package=package)
+
+    # dev_key is NOT stored in the DB and NOT asked from the user — it is resolved
+    # at run time from games_config.py by matching the job's package.
+    dev_key  = _dev_key_for_package(package)
 
     if os_ == "ios":
         device_id = (env.get("idfa") or job.get("gaid") or "").strip()
@@ -178,8 +233,6 @@ def execute_job(self, job_id: int, _sent_events: list | None = None) -> dict:
         job.get("proxy_user", ""), job.get("proxy_pass", ""),
         scheme=(job.get("proxy_scheme") or "http"),
     )
-    package = job["package"]
-    url     = APPSFLYER_URL.format(package=package)
 
     # ── Fail-Fast gate (os has a safe default, so it isn't checked here) ──────
     def _critical_abort(field: str) -> dict:
@@ -189,9 +242,9 @@ def execute_job(self, job_id: int, _sent_events: list | None = None) -> dict:
         return {"job_id": job_id, "status": "failed", "reason": error_msg}
 
     if not dev_key:
-        # dev_key is strictly package-specific; we never fall back to a global key.
-        logger.error(f"[Worker] Job {job_id} package={package} has NO dev_key — aborting (no global fallback).")
-        return _critical_abort("dev_key")
+        logger.error("[Worker] Job %s: package '%s' is missing from games_config.py "
+                     "(or has no dev_key) — cannot resolve key, aborting.", job_id, package)
+        return _critical_abort(f"dev_key for package '{package}' in games_config")
 
     if not device_id:
         field = "idfa" if os_ == "ios" else "advertising_id (gaid)"
@@ -326,6 +379,3 @@ def _update_job_status(job_id, status, output):
                 """, (status, output, job_id))
     except Exception as e:
         logger.error(f"[DB] Failed to update job status: {e}")
-@celery.task(name="tasks.job_tasks.debug_ping")
-def debug_ping():
-    return "pong"
