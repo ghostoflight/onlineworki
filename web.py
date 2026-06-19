@@ -31,6 +31,12 @@ from tasks.job_tasks import execute_job           # استدعاء المهمة 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Force-log the resolved configuration this process actually sees (masked).
+try:
+    config.log_summary()
+except Exception as _e:
+    print(f"[config] log_summary failed: {_e}", file=sys.stderr)
+
 app = Flask(__name__)
 app.secret_key = config.SECRET_KEY
 CORS(app, origins="*")
@@ -205,6 +211,78 @@ def telegram_unlink():
 @app.get("/")
 def index():
     return jsonify({"status": "online", "version": "3.0"})
+
+
+@app.get("/debug/health")
+def debug_health():
+    """
+    Self-contained diagnosis — ALWAYS returns 200 with a per-subsystem report,
+    so you can find the broken hop without access to Railway logs. Each check is
+    isolated: one failing subsystem never hides the others.
+    """
+    report = {"ok": True, "checks": {}}
+
+    def _check(name, fn):
+        try:
+            report["checks"][name] = {"ok": True, "detail": fn()}
+        except Exception as e:
+            report["ok"] = False
+            report["checks"][name] = {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+    # 1) resolved config (masked)
+    _check("config", lambda: config.summary())
+    # 2) imports actually load in THIS container
+    def _imports():
+        import importlib
+        for m in ("celery_app", "tasks.job_tasks", "bot.telegram_bot"):
+            importlib.import_module(m)
+        from tasks.job_tasks import execute_job, scan_and_dispatch_due_jobs, debug_ping  # noqa
+        return "celery_app, tasks.job_tasks, bot.telegram_bot, debug_ping all import OK"
+    _check("imports", _imports)
+    # 3) database round-trip
+    def _db():
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 AS x")
+                return f"SELECT 1 → {cur.fetchone()['x']}"
+    _check("database", _db)
+    # 4) broker reachable from THIS (web) process
+    def _broker():
+        from celery_app import broker_ping
+        ok, err = broker_ping(timeout=5)
+        if not ok:
+            raise RuntimeError(err)
+        return "broker connection OK"
+    _check("broker", _broker)
+    # 5) full round-trip: enqueue debug_ping and wait for a worker to return it
+    def _roundtrip():
+        from tasks.job_tasks import debug_ping
+        r = debug_ping.delay()
+        return {"task_id": r.id, "result": r.get(timeout=10)}
+    _check("celery_roundtrip", _roundtrip)
+
+    return jsonify(report), 200
+
+
+@app.get("/debug/celery")
+def debug_celery():
+    """Quick broker + round-trip probe. Never 500s — always returns a JSON verdict."""
+    out = {"broker_ok": False, "task_id": None, "result": None, "error": None}
+    try:
+        out["broker"] = (config.CELERY_BROKER_URL or "").split("@")[-1]
+        from celery_app import broker_ping
+        ok, err = broker_ping(timeout=5)
+        out["broker_ok"] = ok
+        if not ok:
+            out["error"] = f"broker connect failed: {err}"
+            return jsonify(out), 200
+        from tasks.job_tasks import debug_ping
+        r = debug_ping.delay()
+        out["task_id"] = r.id
+        out["result"] = r.get(timeout=10)
+    except Exception as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+    return jsonify(out), 200
 
 
 @app.post("/auth/login")
@@ -632,10 +710,16 @@ def run_job_now(job_id):
     if request.current_user["role"] != "admin" and job["user_id"] != request.current_user["id"]:
         return jsonify({"error": "Forbidden"}), 403
 
-    # ← هنا الفرق الجوهري عن الكود القديم:
-    # نُرسل للـ Queue بدلاً من التنفيذ المباشر
-    task = execute_job.apply_async(args=[job_id])
-    return jsonify({"ok": True, "task_id": task.id})
+    # Enqueue to the Celery queue (do NOT execute inline). Catch broker errors
+    # loudly — a silent ConnectionError here is the classic "nothing runs" cause.
+    try:
+        task = execute_job.apply_async(args=[job_id])
+        logger.info("[Enqueue] execute_job queued id=%s task=%s", job_id, task.id)
+        return jsonify({"ok": True, "task_id": task.id})
+    except Exception as e:
+        logger.error("[Enqueue] FAILED to queue execute_job id=%s: %s: %s",
+                     job_id, type(e).__name__, e)
+        return jsonify({"ok": False, "error": f"broker enqueue failed: {e}"}), 503
 
 
 @app.get("/jobs/<int:job_id>/logs")
