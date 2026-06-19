@@ -56,6 +56,11 @@ celery.conf.update(
     # ─── Result Expiry ────────────────────────────────────────────────────
     result_expires=3600,
 
+    # ─── Logging ──────────────────────────────────────────────────────────
+    # Do NOT let Celery replace the root logger — we attach our own Postgres
+    # sink handler (db_logging) and need it to stay on the root logger.
+    worker_hijack_root_logger=False,
+
     # ─── Celery Beat Schedule ─────────────────────────────────────────────
     beat_schedule={
         "scan-due-jobs-every-minute": {
