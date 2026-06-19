@@ -69,6 +69,26 @@ def _default_dev_key() -> str:
     return getattr(config, "DEFAULT_DEV_KEY", "") or os.environ.get("DEFAULT_DEV_KEY", "")
 
 
+def _dev_key_for_package(package: str) -> str:
+    """Resolve a package's dev_key from games_config.GAMES_DATA (config-only)."""
+    target = str(package or "").strip()
+    for g in GAMES_DATA:
+        if str(g.get("package", "")).strip() == target:
+            return str(g.get("dev_key", "") or "").strip()
+    return ""
+
+
+def _resolve_dev_key(app_cfg: dict) -> str:
+    """
+    Single source of truth for the dev_key on the Sniper path:
+    the app's own key (app_cfg is the GAMES_DATA entry) → lookup by package
+    → optional global default. Never the DB.
+    """
+    return (str(app_cfg.get("dev_key", "") or "").strip()
+            or _dev_key_for_package(app_cfg.get("package"))
+            or _default_dev_key())
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # مستخدمون
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -887,8 +907,8 @@ def _missing_requirements(app_cfg, env):
     قائمة فارغة = جاهز. تمنع تلويث scheduled_jobs أو إرسال Payload فارغ.
     """
     missing = []
-    if not (app_cfg.get("dev_key") or _default_dev_key() or "").strip():
-        missing.append("dev_key")            # admin-side config (not user)
+    if not _resolve_dev_key(app_cfg):
+        missing.append("dev_key")            # config-side (games_config), not user
     os_ = (env.get("os") or "").strip().lower()
     if os_ not in ("android", "ios"):
         missing.append("OS")
@@ -917,10 +937,10 @@ def _dispatch_event(app_cfg, value, user, env):
     global key — then fall back to the admin default only if the app omits one.
     """
     package = app_cfg["package"]
-    dev_key = app_cfg.get("dev_key") or _default_dev_key()
+    dev_key = _resolve_dev_key(app_cfg)      # config-only: app entry → package lookup → default
     if not (dev_key or "").strip():
         # Defensive: never POST without a key. transport_error=True ⇒ credit refunded.
-        logger.warning(f"[Dispatch] aborted: missing dev_key for package={package}")
+        logger.warning(f"[Dispatch] aborted: no dev_key in games_config for package={package}")
         return False, "missing dev_key", True
 
     # User input (value) is the explicit eventName; otherwise the app's default event.
@@ -1012,7 +1032,7 @@ def _do_execute_now_inner(chat_id, user, idx, value, env=None):
     # ── Diagnostic / QA mode: build and show the payload, send nothing, no credit ──
     if _get_diag(user["id"]):
         uid = user["id"]
-        dev_key = app_cfg.get("dev_key") or _default_dev_key() or ""
+        dev_key = _resolve_dev_key(app_cfg)   # config-only (diagnostic preview)
         event_name = (value or "").strip() or app_cfg.get("event", "af_level_achieved")
         os_ = (env.get("os") or "").lower()
         body = {
@@ -1246,7 +1266,7 @@ def _schedule_test(user, idx, value, minutes, env=None):
 
     # إصلاح منطقي: القيمة الممرّرة (value) هي eventName الصريح، وإلا الافتراضي
     event_name = (value or "").strip() or app_cfg.get("event", "af_level_achieved")
-    dev_key = app_cfg.get("dev_key") or _default_dev_key()
+    dev_key = _resolve_dev_key(app_cfg)        # config-only; resolved by package
     os_ = (env.get("os") or "").lower()
     device_id = env.get("idfa", "") if os_ == "ios" else env.get("gaid", "")
     p_host, p_port, p_user, p_pass = _proxy_parts(env.get("proxy", ""))
