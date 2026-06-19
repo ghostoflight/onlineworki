@@ -74,6 +74,13 @@ try:
 except Exception as _e:
     print(f"[config] log_summary failed: {_e}", file=sys.stderr)
 
+# Shared Postgres log sink (non-blocking) so /debug/logs can show ALL containers.
+try:
+    from db_logging import install_db_logging
+    install_db_logging("web")
+except Exception as _e:
+    print(f"[db_logging] install failed: {_e}", file=sys.stderr)
+
 app = Flask(__name__)
 app.secret_key = config.SECRET_KEY
 CORS(app, origins="*")
@@ -248,12 +255,15 @@ def telegram_unlink():
 @app.get("/debug/logs")
 def debug_logs():
     """
-    Returns the last (up to 200) captured log lines as plain text.
+    Reads the latest log lines from the shared `system_logs` table — so the WEB
+    service can show logs from ALL containers (web, worker, beat).
 
     Query params:
-      ?n=100              → how many lines (1..200, default 200)
-      ?level=WARNING      → only this level and above (DEBUG/INFO/WARNING/ERROR)
-      ?order=desc         → newest first (default 'asc' = oldest→newest)
+      ?n=200              → how many lines (1..500, default 200)
+      ?level=WARNING      → only this level and above
+      ?service=worker     → filter by origin container (web/worker/beat)
+      ?order=asc          → oldest→newest (default 'desc' = newest first)
+      ?source=memory      → bypass the DB and show THIS process's local buffer
     Optional gate: set env DEBUG_LOG_TOKEN and pass ?token=… to restrict access.
     """
     gate = os.environ.get("DEBUG_LOG_TOKEN", "")
@@ -261,26 +271,56 @@ def debug_logs():
         return Response("forbidden\n", status=403, mimetype="text/plain")
 
     try:
-        n = max(1, min(int(request.args.get("n", 200)), 200))
+        n = max(1, min(int(request.args.get("n", 200)), 500))
     except (TypeError, ValueError):
         n = 200
+    level = request.args.get("level", "").upper()
+    service = request.args.get("service", "").strip()
+    order = request.args.get("order", "desc").lower()
 
-    min_level = 0
-    lvl_arg = request.args.get("level", "").upper()
-    if lvl_arg:
-        lv = logging.getLevelName(lvl_arg)        # name → int, or "Level X" if unknown
-        if isinstance(lv, int):
-            min_level = lv
+    # explicit local fallback (this web process only)
+    if request.args.get("source") == "memory":
+        with _LOG_LOCK:
+            lines = [ln for (_lv, ln) in list(_LOG_BUFFER)][-n:]
+        if order == "desc":
+            lines.reverse()
+        return Response(("\n".join(lines) or "(empty)") + "\n", mimetype="text/plain")
 
-    with _LOG_LOCK:
-        items = list(_LOG_BUFFER)
+    _LEVELS = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+    try:
+        q = "SELECT created_at, service, level, logger, message FROM system_logs"
+        conds, params = [], []
+        if level in _LEVELS:
+            conds.append("level = ANY(%s)")
+            params.append(_LEVELS[_LEVELS.index(level):])
+        if service:
+            conds.append("service = %s")
+            params.append(service)
+        if conds:
+            q += " WHERE " + " AND ".join(conds)
+        q += " ORDER BY id DESC LIMIT %s"
+        params.append(n)
 
-    lines = [line for (levelno, line) in items if levelno >= min_level][-n:]
-    if request.args.get("order", "asc").lower() == "desc":
-        lines.reverse()
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(q, params)
+                rows = cur.fetchall()
 
-    body = "\n".join(lines) if lines else "(no logs captured yet)"
-    return Response(body + "\n", mimetype="text/plain")
+        fmt = lambda r: (f"{r['created_at']:%Y-%m-%d %H:%M:%S} "
+                         f"{r['level']:<7} [{r['service']}] {r['logger']}: {r['message']}")
+        lines = [fmt(r) for r in rows]          # rows are newest-first from SQL
+        if order == "asc":
+            lines.reverse()
+        body = "\n".join(lines) if lines else "(no logs in system_logs yet)"
+        return Response(body + "\n", mimetype="text/plain")
+    except Exception as e:
+        # DB sink unreadable → fall back to this process's in-memory buffer
+        with _LOG_LOCK:
+            lines = [ln for (_lv, ln) in list(_LOG_BUFFER)][-n:]
+        if order == "desc":
+            lines.reverse()
+        head = f"(system_logs read failed: {type(e).__name__}: {e} — showing local web buffer)\n"
+        return Response(head + "\n".join(lines) + "\n", mimetype="text/plain")
 
 
 @app.get("/")
