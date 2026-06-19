@@ -326,3 +326,6 @@ def _update_job_status(job_id, status, output):
                 """, (status, output, job_id))
     except Exception as e:
         logger.error(f"[DB] Failed to update job status: {e}")
+@celery.task(name="tasks.job_tasks.debug_ping")
+def debug_ping():
+    return "pong"
