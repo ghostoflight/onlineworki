@@ -19,6 +19,7 @@ tg_state) لتعمل مع عدّة عمّال Gunicorn.
 import os
 import re
 import json
+import time
 import hashlib
 import html
 import logging
@@ -92,11 +93,86 @@ def _resolve_dev_key(app_cfg: dict) -> str:
 # ═══════════════════════════════════════════════════════════════════════════════
 # مستخدمون
 # ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# Per-process session cache (single gunicorn worker ⇒ fully consistent).
+# Removes the 4–6 sequential Supabase round-trips that were on every button press:
+# the first click loads user + all user_data once; subsequent clicks (within TTL)
+# hit memory and do ZERO DB queries. Every write invalidates immediately.
+# ═══════════════════════════════════════════════════════════════════════════════
+_CACHE_TTL = 60.0
+_USER_CACHE: dict = {}        # chat_id(str) -> (ts, user_dict)
+_UD_CACHE: dict = {}          # user_id(int) -> (ts, {key: value})
+_UID_CHAT: dict = {}          # user_id(int) -> chat_id(str)   (for invalidation)
+_cache_lock = threading.Lock()
+
+
+def _cache_get_user(chat_id):
+    with _cache_lock:
+        e = _USER_CACHE.get(str(chat_id))
+    return e[1] if e and (time.time() - e[0]) < _CACHE_TTL else None
+
+
+def _cache_put_user(chat_id, user):
+    if not user:
+        return
+    with _cache_lock:
+        _USER_CACHE[str(chat_id)] = (time.time(), user)
+        _UID_CHAT[user["id"]] = str(chat_id)
+
+
+def _cache_get_ud(user_id):
+    with _cache_lock:
+        e = _UD_CACHE.get(user_id)
+    return dict(e[1]) if e and (time.time() - e[0]) < _CACHE_TTL else None
+
+
+def _cache_put_ud(user_id, d):
+    with _cache_lock:
+        _UD_CACHE[user_id] = (time.time(), dict(d))
+
+
+def _cache_set_ud_key(user_id, key, value):
+    """Keep the cached user_data dict coherent after a single-key write."""
+    with _cache_lock:
+        e = _UD_CACHE.get(user_id)
+        if e:
+            e[1][key] = value
+
+
+def _cache_del_ud_key(user_id, key):
+    with _cache_lock:
+        e = _UD_CACHE.get(user_id)
+        if e:
+            e[1].pop(key, None)
+
+
+def _invalidate_user(user_id):
+    """Drop cached rows for a user after any write to `users` (e.g. balance)."""
+    with _cache_lock:
+        _UD_CACHE.pop(user_id, None)
+        ch = _UID_CHAT.get(user_id)
+        if ch is not None:
+            _USER_CACHE.pop(ch, None)
+
+
+def _invalidate_chat(chat_id):
+    with _cache_lock:
+        e = _USER_CACHE.pop(str(chat_id), None)
+        if e:
+            _UD_CACHE.pop(e[1]["id"], None)
+
+
 def _user_by_chat(chat_id) -> dict | None:
+    cached = _cache_get_user(chat_id)
+    if cached is not None:
+        return cached
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM users WHERE tg_chat_id = %s AND active = 1", (str(chat_id),))
-            return cur.fetchone()
+            row = cur.fetchone()
+    if row:
+        _cache_put_user(chat_id, row)
+    return row
 
 
 def _user_by_id(user_id) -> dict | None:
@@ -144,12 +220,14 @@ def _set_chat(user_id, chat_id):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE users SET tg_chat_id=%s WHERE id=%s", (str(chat_id), user_id))
+    _invalidate_user(user_id); _invalidate_chat(chat_id)
 
 
 def _clear_chat(chat_id):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE users SET tg_chat_id=NULL WHERE tg_chat_id=%s", (str(chat_id),))
+    _invalidate_chat(chat_id)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -163,20 +241,29 @@ def _ud_set(user_id, key, value):
                    ON CONFLICT (user_id, key) DO UPDATE SET value=EXCLUDED.value, updated=NOW()""",
                 (user_id, key, value),
             )
+    _cache_set_ud_key(user_id, key, value)
+
+
+def _ud_load_all(user_id) -> dict:
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT key, value FROM user_data WHERE user_id=%s", (user_id,))
+            return {r["key"]: r["value"] for r in cur.fetchall()}
 
 
 def _ud_get(user_id, key):
-    with get_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT value FROM user_data WHERE user_id=%s AND key=%s", (user_id, key))
-            row = cur.fetchone()
-    return row["value"] if row else None
+    cached = _cache_get_ud(user_id)
+    if cached is None:
+        cached = _ud_load_all(user_id)        # ONE round-trip for state+env+lang+diag+notify
+        _cache_put_ud(user_id, cached)
+    return cached.get(key)
 
 
 def _ud_del(user_id, key):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM user_data WHERE user_id=%s AND key=%s", (user_id, key))
+    _cache_del_ud_key(user_id, key)
 
 
 # ── الحالة (state machine) ───────────────────────────────────────────────────
@@ -572,6 +659,7 @@ def _grant_subscription(user_id, plan_key):
                 "UPDATE users SET uses_left = uses_left + %s, max_uses = max_uses + %s WHERE id=%s",
                 (int(p["credits"]), int(p["credits"]), user_id),
             )
+    _invalidate_user(user_id)
     return expires
 
 
@@ -676,6 +764,7 @@ def _admin_add_credits(uid, n) -> None:
                 "max_uses = GREATEST(max_uses, uses_left + %s) WHERE id=%s",
                 (n, n, uid),
             )
+    _invalidate_user(uid)
 
 
 def _delete_user(uid) -> None:
@@ -685,6 +774,7 @@ def _delete_user(uid) -> None:
             for t in ("subscriptions", "payments", "support_tickets"):
                 cur.execute(f"DELETE FROM {t} WHERE user_id=%s", (uid,))
             cur.execute("DELETE FROM users WHERE id=%s", (uid,))   # cascades the rest
+    _invalidate_user(uid)
 
 
 # ── Admin dashboard renderers (module-level; HTML, each ends with a Home btn) ─
@@ -838,6 +928,7 @@ def _consume_use(user):
                 (user["id"],),
             )
             row = cur.fetchone()
+    _invalidate_user(user["id"])
     return (True, row["uses_left"]) if row else (False, 0)
 
 
@@ -847,6 +938,7 @@ def _refund_use(user):
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("UPDATE users SET uses_left = uses_left + 1 WHERE id=%s", (user["id"],))
+    _invalidate_user(user["id"])
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1102,25 +1194,89 @@ def _parse_delay_minutes(text):
     return n * 60 if unit == "h" else n * 1440
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# Event resolution — shared by Sniper AND Scheduler.
+# The user sends a NUMBER (the event's position in the game's level_events list,
+# 1-based) and we translate it to the real AppsFlyer event name (template).
+# Templates may contain "{}" for a level; an optional second number fills it.
+#   "3"     → level_events[2].template
+#   "3 5"   → level_events[2].template.format(5)   (e.g. af_area_{}_completed → af_area_5_completed)
+# A non-numeric input is accepted as a literal event name (back-compat / power users).
+# ═══════════════════════════════════════════════════════════════════════════════
+def _event_list(app_cfg) -> list:
+    evs = app_cfg.get("level_events") or []
+    return evs if isinstance(evs, list) else []
+
+
+def _event_menu_text(app_cfg, uid) -> str:
+    """Numbered list of the game's events, so the user knows which number to send."""
+    evs = _event_list(app_cfg)
+    if not evs:
+        return _t("ask_event_name", uid)
+    lines = []
+    for i, ev in enumerate(evs, 1):
+        label = str(ev.get("display") or ev.get("template") or f"event {i}")
+        hint = " — n L" if "{}" in str(ev.get("template") or "") else ""
+        lines.append(f"<b>{i}</b>) {html.escape(label)}{hint}")
+    return _t("choose_event", uid, list="\n".join(lines))
+
+
+def _resolve_event(app_cfg, raw):
+    """
+    Returns (event_name:str|None, error_key:str|None).
+    Translates an event NUMBER (1-based) into the game's event template.
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None, "event_empty"
+    evs = _event_list(app_cfg)
+    m = re.match(r"^(\d+)(?:\s*[:.\s]\s*(\d+))?$", raw)
+    if m:
+        if not evs:
+            return None, "no_events_configured"
+        idx = int(m.group(1))
+        if idx < 1 or idx > len(evs):
+            return None, "event_out_of_range"
+        tmpl = str(evs[idx - 1].get("template") or evs[idx - 1].get("display") or "").strip()
+        if "{}" in tmpl:
+            tmpl = tmpl.format(m.group(2) if m.group(2) is not None else "1")
+        return (tmpl, None) if tmpl else (None, "event_out_of_range")
+    # not a number → treat as a literal event name
+    return raw, None
+
+
+def _parse_duration_minutes(text):
+    """
+    '90'→90 min, '30m'→30, '1.5h'→90, '2d'→2880. Default unit = MINUTES.
+    Returns float minutes (>0) or None.
+    """
+    s = (text or "").strip().lower().replace(" ", "")
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([mhd]?)", s)
+    if not m:
+        return None
+    val = float(m.group(1))
+    mult = {"": 1, "m": 1, "h": 60, "d": 1440}[m.group(2)]
+    mins = val * mult
+    return mins if mins > 0 else None
+
+
 def _parse_custom(text):
     """
-    وضع المخصّص: "Event | Hours" → (event, minutes) أو None.
-    الجزء الأيمن يقبل رقم ساعات (24) أو صيغة التأخير (24h / 3d).
+    New unified format: "<event_number> | <duration>"   (duration defaults to MINUTES)
+      e.g.  "3 | 90"    → event #3 after 90 minutes
+            "3 | 1.5h"  → event #3 after 90 minutes
+            "2 5 | 30m" → event #2 (level 5) after 30 minutes
+    Returns (event_raw:str, minutes:float) or None. Event translation happens later
+    against the current game so we can show a proper error list.
     """
     if "|" not in (text or ""):
         return None
     left, right = text.split("|", 1)
-    event = left.strip()
-    right = right.strip()
-    if not event:
+    event_raw = left.strip()
+    minutes = _parse_duration_minutes(right.strip())
+    if not event_raw or minutes is None:
         return None
-    if re.fullmatch(r"\d+", right):
-        h = int(right)
-        if h <= 0:
-            return None
-        return event, h * 60
-    minutes = _parse_delay_minutes(right)   # يدعم 24h / 3d أيضاً
-    return (event, minutes) if minutes else None
+    return event_raw, minutes
 
 
 def _send_mode_menu(chat_id, app_cfg, uid=0):
@@ -1273,7 +1429,9 @@ def _schedule_test(user, idx, value, minutes, env=None):
     p_scheme = _proxy_scheme(env.get("proxy", ""))
     name = f"{app_cfg['name']} · {event_name}"
     events = json.dumps([{"name": event_name}])
-    minutes = max(1, int(minutes or 0))      # never schedule in the past / now-ish
+    # support fractional minutes (e.g. 1.5h) via seconds; floor at 60s since Beat
+    # scans once a minute anyway, and never schedule in the past.
+    secs = max(60, int(round(float(minutes or 0) * 60)))
 
     try:
         with get_conn() as conn:
@@ -1284,15 +1442,15 @@ def _schedule_test(user, idx, value, minutes, env=None):
                           proxy_host, proxy_port, proxy_user, proxy_pass, proxy_scheme,
                           run_at, enabled)
                        VALUES (%s,%s,%s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                               NOW() + make_interval(mins => %s), 1)
+                               NOW() + make_interval(secs => %s), 1)
                        RETURNING run_at""",
                     (user["id"], name, events, app_cfg["package"], dev_key,
                      device_id, env.get("afid", ""), os_,
-                     p_host, p_port, p_user, p_pass, p_scheme, minutes),
+                     p_host, p_port, p_user, p_pass, p_scheme, secs),
                 )
                 run_at = cur.fetchone()["run_at"]
-        logger.info("[Schedule] queued job for user=%s package=%s in %d min → run_at=%s (UTC)",
-                    user["id"], app_cfg["package"], minutes, run_at)
+        logger.info("[Schedule] queued user=%s package=%s in %ss → run_at=%s (UTC)",
+                    user["id"], app_cfg["package"], secs, run_at)
         return "ok", run_at
     except Exception as e:
         _refund_use(user)   # فشل الإدراج — أعد الرصيد
@@ -1473,8 +1631,12 @@ def _open_apps(chat_id, user):
     if not GAMES_DATA:
         bot.send_message(chat_id, _t("no_apps_defined", user["id"]))
         return
+    t0 = time.time()
     _set_state(user["id"], "apps_os", {})   # entry of the cascading flow (no history)
+    t1 = time.time()
     _render_os_ui(chat_id, user)
+    logger.info("[Perf] open_apps: set_state=%.0fms render_os=%.0fms total=%.0fms (user=%s)",
+                (t1 - t0) * 1000, (time.time() - t1) * 1000, (time.time() - t0) * 1000, user.get("id"))
 
 
 def _open_profile(chat_id, user):
@@ -2281,11 +2443,16 @@ def _register_handlers():
             return
         if action == "sniper":
             _set_state(u["id"], "sniper_value", data)
-            bot.send_message(c.message.chat.id, _t("ask_event", u["id"]),
+            idx = data.get("app_index", -1)
+            app_cfg = GAMES_DATA[idx] if 0 <= idx < len(GAMES_DATA) else {}
+            bot.send_message(c.message.chat.id, _event_menu_text(app_cfg, u["id"]),
                              parse_mode="HTML", reply_markup=types.ForceReply(selective=False))
         elif action == "custom":
             _set_state(u["id"], "custom_input", data)
-            bot.send_message(c.message.chat.id, _t("ask_delay", u["id"]),
+            idx = data.get("app_index", -1)
+            app_cfg = GAMES_DATA[idx] if 0 <= idx < len(GAMES_DATA) else {}
+            bot.send_message(c.message.chat.id,
+                             _event_menu_text(app_cfg, u["id"]) + "\n\n" + _t("ask_schedule", u["id"]),
                              parse_mode="HTML", reply_markup=types.ForceReply(selective=False))
 
     # ── أزرار المهام القديمة ──────────────────────────────────────────────────
@@ -2431,27 +2598,39 @@ def _register_handlers():
                     _send_mode_menu(m.chat.id, GAMES_DATA[idx], u["id"])
 
             elif step == "sniper_value":
-                # 🎯 القناص: تنفيذ فوري ببيانات الجهاز الخاصة بالمهمة
+                # 🎯 Sniper: user sends an event NUMBER → translate to the real name
                 idx = data.get("app_index", -1)
+                app_cfg = GAMES_DATA[idx] if 0 <= idx < len(GAMES_DATA) else {}
+                event_name, err = _resolve_event(app_cfg, text)
+                if err:
+                    bot.reply_to(m, _event_menu_text(app_cfg, u["id"]),
+                                 parse_mode="HTML", reply_markup=types.ForceReply(selective=False))
+                    return  # keep state, let them retry
                 env = _env_from_data(data)
                 _clear_state(u["id"])
-                _do_execute_now(m.chat.id, u, idx, text, env=env)
+                _do_execute_now(m.chat.id, u, idx, event_name, env=env)
 
             elif step == "custom_input":
-                # ✍️ المخصّص: "Event | Hours" → جدولة ببيانات المهمة
+                # ✍️ Schedule: "<event_number> | <duration>" (duration defaults to minutes)
                 parsed = _parse_custom(text)
                 if not parsed:
-                    bot.reply_to(m, _t("ask_delay", u["id"]),
+                    bot.reply_to(m, _t("ask_schedule", u["id"]),
                                  parse_mode="HTML", reply_markup=types.ForceReply(selective=False))
-                    return  # نُبقي الحالة لإعادة المحاولة
-                event, minutes = parsed
+                    return  # keep state to retry
+                event_raw, minutes = parsed
                 idx = data.get("app_index", -1)
+                app_cfg = GAMES_DATA[idx] if 0 <= idx < len(GAMES_DATA) else {}
+                event_name, err = _resolve_event(app_cfg, event_raw)
+                if err:
+                    bot.reply_to(m, _event_menu_text(app_cfg, u["id"]) + "\n\n" + _t("ask_schedule", u["id"]),
+                                 parse_mode="HTML", reply_markup=types.ForceReply(selective=False))
+                    return
                 env = _env_from_data(data)
                 _clear_state(u["id"])
-                status, result = _schedule_test(u, idx, event, minutes, env=env)
+                status, result = _schedule_test(u, idx, event_name, minutes, env=env)
                 if status == "ok":
                     when_txt = result.strftime("%Y-%m-%d %H:%M UTC") if hasattr(result, "strftime") else str(result)
-                    bot.reply_to(m, _t("sched_ok", u["id"], event=html.escape(event), when=html.escape(when_txt)),
+                    bot.reply_to(m, _t("sched_ok", u["id"], event=html.escape(event_name), when=html.escape(when_txt)),
                                  parse_mode="HTML")
                 elif status == "invalid":
                     bot.reply_to(m, _requirements_message(result, u["id"]))
