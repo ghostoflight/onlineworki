@@ -67,6 +67,10 @@ celery.conf.update(
             "task":     "tasks.job_tasks.scan_and_dispatch_due_jobs",
             "schedule": 60.0,
         },
+        "reap-stuck-jobs-every-5min": {
+            "task":     "tasks.job_tasks.reap_stuck_jobs",
+            "schedule": 300.0,             # every 5 minutes
+        },
         "prune-system-logs-every-8h": {
             "task":     "tasks.job_tasks.prune_system_logs",
             "schedule": 8 * 3600.0,        # every 8 hours
