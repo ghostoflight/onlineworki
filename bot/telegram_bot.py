@@ -248,7 +248,28 @@ def _ud_load_all(user_id) -> dict:
     with get_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT key, value FROM user_data WHERE user_id=%s", (user_id,))
-            return {r["key"]: r["value"] for r in cur.fetchall()}
+            d = {r["key"]: r["value"] for r in cur.fetchall()}
+    d.pop("tg_state", None)   # NEVER cache the volatile state machine (cross-worker safe)
+    return d
+
+
+def _db_get_one(user_id, key):
+    """Direct DB read of a single user_data key — bypasses the cache (for volatile keys)."""
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM user_data WHERE user_id=%s AND key=%s", (user_id, key))
+            row = cur.fetchone()
+    return row["value"] if row else None
+
+
+def _db_set_one(user_id, key, value):
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO user_data (user_id, key, value, updated) VALUES (%s,%s,%s,NOW())
+                   ON CONFLICT (user_id, key) DO UPDATE SET value=EXCLUDED.value, updated=NOW()""",
+                (user_id, key, value),
+            )
 
 
 def _ud_get(user_id, key):
@@ -267,12 +288,16 @@ def _ud_del(user_id, key):
 
 
 # ── الحالة (state machine) ───────────────────────────────────────────────────
+# tg_state is VOLATILE and must be consistent across processes, so it is read and
+# written DIRECTLY from the DB — never cached. (The per-process cache is only for
+# semi-static data: user, lang, env, notify, diag.)
 def _set_state(user_id, step, data=None):
-    _ud_set(user_id, "tg_state", json.dumps({"step": step, "data": data or {}}))
+    _db_set_one(user_id, "tg_state", json.dumps({"step": step, "data": data or {}}))
+    _cache_del_ud_key(user_id, "tg_state")   # belt-and-suspenders: drop any stale local copy
 
 
 def _get_state(user_id):
-    raw = _ud_get(user_id, "tg_state")
+    raw = _db_get_one(user_id, "tg_state")   # ALWAYS fresh from DB
     if not raw:
         return None, {}
     try:
@@ -283,7 +308,10 @@ def _get_state(user_id):
 
 
 def _clear_state(user_id):
-    _ud_del(user_id, "tg_state")
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM user_data WHERE user_id=%s AND key=%s", (user_id, "tg_state"))
+    _cache_del_ud_key(user_id, "tg_state")
 
 
 # ── بيئة المختبِر ─────────────────────────────────────────────────────────────
