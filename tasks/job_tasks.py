@@ -220,7 +220,7 @@ def execute_job(self, job_id: int, _sent_events: list | None = None) -> dict:
 
     # dev_key is NOT stored in the DB and NOT asked from the user — it is resolved
     # at run time from games_config.py by matching the job's package.
-    dev_key  = _dev_key_for_package(package)
+    dev_key = str(job.get("dev_key") or _dev_key_for_package(package)).strip()
 
     if os_ == "ios":
         device_id = (env.get("idfa") or job.get("gaid") or "").strip()
