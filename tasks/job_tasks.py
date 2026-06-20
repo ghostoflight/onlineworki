@@ -12,6 +12,7 @@ Aligned with the refactored controller:
 """
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from urllib.parse import quote
 
@@ -134,6 +135,29 @@ def debug_ping() -> str:
     return "pong"
 
 
+@celery.task(name="tasks.job_tasks.prune_system_logs")
+def prune_system_logs() -> dict:
+    """
+    Housekeeping (runs on Beat every 8h): delete old rows from system_logs so the
+    shared log sink can't grow unbounded on Supabase. Retention is configurable
+    via LOG_RETENTION_HOURS (default 24h).
+    """
+    hours = int(os.environ.get("LOG_RETENTION_HOURS", "24"))
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM system_logs WHERE created_at < NOW() - make_interval(hours => %s)",
+                    (hours,),
+                )
+                deleted = cur.rowcount
+        logger.info("[Prune] system_logs: deleted %s rows older than %sh", deleted, hours)
+        return {"deleted": deleted, "older_than_hours": hours}
+    except Exception as e:
+        logger.error("[Prune] system_logs prune failed: %s", e)
+        return {"error": str(e)}
+
+
 @celery.task(name="tasks.job_tasks.scan_and_dispatch_due_jobs")
 def scan_and_dispatch_due_jobs() -> dict:
     """
@@ -220,7 +244,7 @@ def execute_job(self, job_id: int, _sent_events: list | None = None) -> dict:
 
     # dev_key is NOT stored in the DB and NOT asked from the user — it is resolved
     # at run time from games_config.py by matching the job's package.
-    dev_key = str(job.get("dev_key") or _dev_key_for_package(package)).strip()
+    dev_key  = _dev_key_for_package(package)
 
     if os_ == "ios":
         device_id = (env.get("idfa") or job.get("gaid") or "").strip()
