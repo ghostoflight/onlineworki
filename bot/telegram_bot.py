@@ -1244,15 +1244,24 @@ def _event_menu_text(app_cfg, uid) -> str:
     lines = []
     for i, ev in enumerate(evs, 1):
         label = str(ev.get("display") or ev.get("template") or f"event {i}")
-        hint = " — n L" if "{}" in str(ev.get("template") or "") else ""
-        lines.append(f"<b>{i}</b>) {html.escape(label)}{hint}")
-    return _t("choose_event", uid, list="\n".join(lines))
+        lines.append(f"<b>{i}</b>) {html.escape(label)}")
+    text = _t("choose_event", uid, list="\n".join(lines))
+    # Single configured event whose template needs a value → tell the user to
+    # just type the target number directly (no index needed).
+    if len(evs) == 1 and "{}" in str(evs[0].get("template") or ""):
+        text += "\n\n" + _t("event_single_hint", uid)
+    return text
 
 
 def _resolve_event(app_cfg, raw):
     """
     Returns (event_name:str|None, error_key:str|None).
-    Translates an event NUMBER (1-based) into the game's event template.
+    Translates the user's input into the game's event name.
+
+    UX rule for a SINGLE configured event whose template has '{}':
+      a lone number is the VALUE itself (e.g. "5" → "stage_5_done"), no index.
+    Multi-event arrays (or an explicit "index value" like "1 5") keep the old
+    behaviour: first number = 1-based index, optional second number fills '{}'.
     """
     raw = (raw or "").strip()
     if not raw:
@@ -1262,14 +1271,29 @@ def _resolve_event(app_cfg, raw):
     if m:
         if not evs:
             return None, "no_events_configured"
-        idx = int(m.group(1))
+        n1 = int(m.group(1))
+        n2 = m.group(2)            # None unless the user typed two numbers
+
+        # NEW: one event + a single number → treat the number as the value.
+        if len(evs) == 1 and n2 is None:
+            tmpl = str(evs[0].get("template") or evs[0].get("display") or "").strip()
+            if "{}" in tmpl:
+                return tmpl.format(n1), None          # "5" → stage_5_done
+            # static single event (no placeholder): the number selects it (only 1 valid)
+            if n1 == 1 and tmpl:
+                return tmpl, None
+            return None, "event_out_of_range"
+
+        # OLD: multi-event arrays / explicit "index [value]"
+        idx = n1
         if idx < 1 or idx > len(evs):
             return None, "event_out_of_range"
         tmpl = str(evs[idx - 1].get("template") or evs[idx - 1].get("display") or "").strip()
         if "{}" in tmpl:
-            tmpl = tmpl.format(m.group(2) if m.group(2) is not None else "1")
+            tmpl = tmpl.format(n2 if n2 is not None else "1")
         return (tmpl, None) if tmpl else (None, "event_out_of_range")
-    # not a number → treat as a literal event name
+
+    # not a number → treat as a literal event name (power users / back-compat)
     return raw, None
 
 
@@ -2909,4 +2933,3 @@ def maybe_setup_webhook() -> None:
         logger.info(f"[Telegram] webhook set → {url}")
     except Exception as e:
         logger.warning(f"[Telegram] setWebhook failed: {e}")
-      
