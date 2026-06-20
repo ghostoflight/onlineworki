@@ -6,7 +6,13 @@
 # 3. في إعدادات كل Service، غيّر الـ "Start Command" للأمر المقابل أدناه
 
 # ── Service 1: web (Flask API) ─────────────────────────────────────────────
-web: gunicorn web:app --workers=2 --worker-class=gthread --threads=4 --bind=0.0.0.0:$PORT --timeout=60 --log-level=info
+# IMPORTANT: keep --workers=1. The bot uses an in-process cache for session data;
+# multiple workers would each hold a SEPARATE cache, so a write on one worker would
+# not be seen by another → lost state / "session ended". One worker + threads keeps
+# the cache consistent. (tg_state is read straight from the DB regardless, as a
+# second safety net.) Scale via --threads, not --workers, unless you move the
+# cache to Redis.
+web: gunicorn web:app --workers=1 --worker-class=gthread --threads=8 --bind=0.0.0.0:$PORT --timeout=60 --log-level=info
 
 # ── Service 2: worker (Celery Task Executor) ──────────────────────────────
 worker: celery -A worker.celery worker --loglevel=info --concurrency=4 --max-tasks-per-child=100
