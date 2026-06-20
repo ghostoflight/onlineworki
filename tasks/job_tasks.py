@@ -135,6 +135,46 @@ def debug_ping() -> str:
     return "pong"
 
 
+@celery.task(name="tasks.job_tasks.reap_stuck_jobs")
+def reap_stuck_jobs() -> dict:
+    """
+    Reliability net (runs on Beat every few minutes). When the scan claims a due
+    job it flips it to enabled=0 and stamps last_status='dispatched'. A healthy
+    run then records last_run + a real status. If the worker/container dies mid-run,
+    the job is left enabled=0 / last_status='dispatched' / last_run NULL forever.
+
+    This task revives such jobs (back to enabled=1) so the next scan retries them.
+    It targets ONLY scan-claimed jobs (last_status='dispatched'), so user-paused
+    jobs are never touched, and ignores ancient ones (>24h) to avoid endless retries.
+    """
+    grace_min = int(os.environ.get("REAPER_GRACE_MIN", "10"))
+    try:
+        with get_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    UPDATE scheduled_jobs
+                    SET enabled = 1
+                    WHERE enabled = 0
+                      AND last_run IS NULL
+                      AND last_status = 'dispatched'
+                      AND run_at IS NOT NULL
+                      AND run_at <= NOW() - make_interval(mins => %s)
+                      AND run_at >= NOW() - make_interval(hours => 24)
+                    RETURNING id, name
+                """, (grace_min,))
+                revived = cur.fetchall()
+    except Exception as e:
+        logger.error("[Reaper] query failed: %s", e)
+        return {"revived": [], "error": str(e)}
+
+    for j in revived:
+        logger.warning("[Reaper] re-enabled stuck job %s (%s) — worker likely died mid-run; "
+                       "will retry on next scan.", j["id"], j["name"])
+    if not revived:
+        logger.info("[Reaper] no stuck jobs.")
+    return {"revived": [j["id"] for j in revived]}
+
+
 @celery.task(name="tasks.job_tasks.prune_system_logs")
 def prune_system_logs() -> dict:
     """
@@ -175,7 +215,8 @@ def scan_and_dispatch_due_jobs() -> dict:
             with conn.cursor() as cur:
                 cur.execute("""
                     UPDATE scheduled_jobs
-                    SET enabled = 0
+                    SET enabled = 0,
+                        last_status = 'dispatched'
                     WHERE enabled = 1
                       AND run_at IS NOT NULL
                       AND run_at <= NOW()
