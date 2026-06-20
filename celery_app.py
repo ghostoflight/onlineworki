@@ -67,6 +67,10 @@ celery.conf.update(
             "task":     "tasks.job_tasks.scan_and_dispatch_due_jobs",
             "schedule": 60.0,
         },
+        "prune-system-logs-every-8h": {
+            "task":     "tasks.job_tasks.prune_system_logs",
+            "schedule": 8 * 3600.0,        # every 8 hours
+        },
     },
 )
 
